@@ -1,0 +1,9 @@
+# frame=robot_base  name x y z  (mid_py yellow, mid_ny cyan, bottom_py orange, bottom_ny blue)
+card_mid_edge_py_marker 0.668999 0.082825 0.724210
+card_mid_edge_ny_marker 0.668945 -0.092173 0.723397
+card_bottom_edge_py_marker 0.668175 0.088009 0.596557
+card_bottom_edge_ny_marker 0.665694 -0.086974 0.596666
+# world card_mid_edge_py_marker 0.595377 -1.113937 0.774427
+# world card_mid_edge_ny_marker 0.598472 -1.288908 0.773614
+# world card_bottom_edge_py_marker 0.594118 -1.108776 0.646777
+# world card_bottom_edge_ny_marker 0.594789 -1.283774 0.646893

@@ -1,0 +1,6 @@
+# frame=robot_base
+0.875033 -0.001383 0.824156
+# world 0.803162 -1.194416 0.873820
+# source card_block_35
+# quat_base 0.995676 -0.002471 0.092642 -0.006470  (w x y z, block orientation in the robot base frame)
+# quat_world 0.995568 -0.003326 0.093950 0.002499

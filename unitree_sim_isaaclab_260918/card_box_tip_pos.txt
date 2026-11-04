@@ -1,0 +1,5 @@
+# frame=robot_base
+-0.413799 0.816375 0.891023
+# world -0.500005 -0.400000 0.944142
+# quat_base 0.505146 0.503818 0.494800 0.496153  (w x y z, conveyor box orientation in the robot base frame; tip face normal = local +z)
+# quat_world 0.500000 0.500000 0.500000 0.500000
