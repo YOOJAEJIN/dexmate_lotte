@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>URDF Viewer</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #131416; }
+        #container { width: 100vw; height: 100vh; }
+    </style>
+    <!-- three 0.160.0의 OrbitControls는 devicePixelRatio < 1(브라우저 페이지 축소) 상태에서
+         휠/드래그 줌 배율이 0으로 나눠져 카메라가 minDistance/maxDistance 사이를 확확 튀는 버그가 있음.
+         0.160.1에서 수정되었으므로 반드시 0.160.1 이상을 사용 (package.json의 three 버전과 동일). -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js",
+                "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/",
+                "urdf-loader": "https://cdn.jsdelivr.net/npm/urdf-loader@0.12.1/src/URDFLoader.js"
+            }
+        }
+    </script>
+</head>
+<body>
+    <!-- 패널은 왼쪽 아래에 둔다: 자동 프레이밍된 로봇의 팔(위쪽)과 겹치지 않도록 -->
+    <div id="axesPanel" style="position: absolute; bottom: 10px; left: 10px; z-index: 100; color: white; background: rgba(0,0,0,0.5); padding: 8px 10px; border-radius: 5px; font-family: sans-serif; font-size: 13px; line-height: 1.7;">
+        <div style="font-weight: bold; margin-bottom: 2px;">Link Axes</div>
+        <div style="font-size: 12px; margin-bottom: 4px; letter-spacing: 0.02em;">
+            <span style="display: inline-block; width: 10px; height: 10px; background: #ff0000; vertical-align: middle; margin-right: 4px;"></span>X
+            <span style="display: inline-block; width: 10px; height: 10px; background: #00ff00; vertical-align: middle; margin: 0 4px 0 10px;"></span>Y
+            <span style="display: inline-block; width: 10px; height: 10px; background: #0000ff; vertical-align: middle; margin: 0 4px 0 10px;"></span>Z
+        </div>
+        <label style="display: block;"><input type="radio" name="axesMode" value="all"> All links</label>
+        <label style="display: block;"><input type="radio" name="axesMode" value="base_ee"> Base + End-effectors</label>
+        <label style="display: block;"><input type="radio" name="axesMode" value="none"> Hide</label>
+        <button id="resetView" title="로봇이 화면 중앙에 꽉 차도록 시점 초기화"
+                style="margin-top: 6px; width: 100%; padding: 3px 0; font-size: 12px; color: white; background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.35); border-radius: 4px; cursor: pointer;">
+            Reset view
+        </button>
+    </div>
+    <div id="container"></div>
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+        import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
+        import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+        import { ColladaLoader } from 'three/examples/jsm/loaders/ColladaLoader.js';
+        import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
+        import URDFLoader from 'urdf-loader';
+
+        let scene, camera, renderer, controls, robot;
+
+        // ── Link axes 표시 모드 ────────────────────────────────────────────────
+        //  all     : 모든 링크의 좌표축 (기존 동작)
+        //  base_ee : 로봇 베이스(base)와 양손 엔드이펙터(L_ee, R_ee) 좌표축만.
+        //            이 모드에서는 세 축을 메시 위에 항상 보이도록(depthTest off) 그리고,
+        //            섀시 메시 안에 묻혀 있는 베이스 축만 확대한다. EE 축 크기는 all 모드와 동일.
+        //  none    : 숨김
+        const AXES_SIZE = 0.1;                       // 모든 링크 축 길이 [m]
+        const AXES_FOCUS_SCALE = 2.5;                // base_ee 모드에서 ENLARGED_LINKS 축 확대 배율
+        const FOCUS_LINKS = new Set(['base', 'L_ee', 'R_ee']);
+        const ENLARGED_LINKS = new Set(['base']);    // base_ee 모드에서 확대할 링크 (EE는 제외)
+        const AXES_MODES = {
+            all:     () => true,
+            base_ee: (linkName) => FOCUS_LINKS.has(linkName),
+            none:    () => false,
+        };
+        const DEFAULT_AXES_MODE = 'all';
+        const AXES_MODE_STORAGE_KEY = 'urdfViewer.axesMode';
+        let axesMode = loadAxesMode();
+
+        function loadAxesMode() {
+            try {
+                const saved = localStorage.getItem(AXES_MODE_STORAGE_KEY);
+                if (saved && saved in AXES_MODES) return saved;
+            } catch (e) { /* localStorage 사용 불가 시 기본값 */ }
+            return DEFAULT_AXES_MODE;
+        }
+
+        function applyAxesMode() {
+            if (!robot) return;
+            const isVisible = AXES_MODES[axesMode];
+            const focus = axesMode === 'base_ee';
+            robot.traverse(c => {
+                if (c.name !== 'axes') return;
+                const linkName = c.userData.linkName;
+                c.visible = isVisible(linkName);
+                const onTop = focus && FOCUS_LINKS.has(linkName);
+                const enlarge = onTop && ENLARGED_LINKS.has(linkName);
+                c.scale.setScalar(enlarge ? AXES_FOCUS_SCALE : 1);
+                c.renderOrder = onTop ? 1 : 0;              // 강조 축은 나중에 그려서 메시 위에 보이게
+                c.traverse(m => {
+                    if (m.isMesh) {
+                        m.material.depthTest = !onTop;
+                        m.material.depthWrite = !onTop;
+                    }
+                });
+            });
+        }
+
+        // ── 카메라 자동 프레이밍 ─────────────────────────────────────────────
+        // 로봇 메시가 모두 로드되면 로봇의 바운딩 박스를 구해, 현재 시선 방향은 유지한 채
+        // 로봇 전체가 뷰포트의 가로·세로에 모두 들어오도록 카메라 타깃(중심)과 거리를 맞춘다.
+        // 뷰어 크기(컬럼 폭)가 바뀌어도 사용자가 직접 돌리거나 줌하기 전까지는 다시 맞춘다.
+        const FRAME_MARGIN = 1.1;        // 바운딩 박스 주변 여백 배율 (1.0 = 꽉 채움)
+        let userAdjustedView = false;    // 사용자가 OrbitControls로 시점을 조작했는가
+
+        function robotBoundingBox() {
+            const box = new THREE.Box3();
+            const meshBox = new THREE.Box3();
+            robot.updateWorldMatrix(true, true);
+            robot.traverse(obj => {
+                if (!obj.isMesh || obj.userData.isAxes || !obj.geometry) return;   // 좌표축 헬퍼는 제외
+                if (!obj.geometry.boundingBox) obj.geometry.computeBoundingBox();
+                meshBox.copy(obj.geometry.boundingBox).applyMatrix4(obj.matrixWorld);
+                box.union(meshBox);
+            });
+            return box;
+        }
+
+        function frameRobot() {
+            if (!robot) return;
+            const box = robotBoundingBox();
+            if (box.isEmpty()) return;
+
+            const center = box.getCenter(new THREE.Vector3());
+            const dir = camera.position.clone().sub(controls.target).normalize();   // 타깃 → 카메라
+            const forward = dir.clone().negate();
+            const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
+            const up = new THREE.Vector3().crossVectors(right, forward).normalize();
+            const tanV = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
+            const tanH = tanV * camera.aspect;
+
+            // 박스의 8개 꼭짓점이 모두 시야각 안에 들어오는 최소 거리
+            let dist = 0;
+            const corner = new THREE.Vector3();
+            for (let i = 0; i < 8; i++) {
+                corner.set(i & 1 ? box.max.x : box.min.x,
+                           i & 2 ? box.max.y : box.min.y,
+                           i & 4 ? box.max.z : box.min.z).sub(center);
+                const depthOffset = corner.dot(forward);   // 카메라 쪽으로 튀어나온 꼭짓점은 음수
+                dist = Math.max(dist,
+                    Math.abs(corner.dot(up)) / tanV - depthOffset,
+                    Math.abs(corner.dot(right)) / tanH - depthOffset);
+            }
+            dist = THREE.MathUtils.clamp(dist * FRAME_MARGIN, controls.minDistance, controls.maxDistance);
+
+            controls.target.copy(center);
+            camera.position.copy(center).addScaledVector(dir, dist);
+            controls.update();
+        }
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x131416);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(1.6, 1.6, 1.4); // 초기 시선 방향(앞-오른쪽 위에서 내려보는 3/4 뷰). 거리는 로드 후 frameRobot()이 맞춤
+            camera.up.set(0, 0, 1);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.shadowMap.enabled = true;
+            document.getElementById('container').appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.target.set(0, 0, 0.7); // 임시 타깃. 로드 후 frameRobot()이 로봇 바운딩 박스 중심으로 옮김
+            controls.update();
+            controls.minDistance = 0.5;
+            controls.maxDistance = 10;
+            controls.addEventListener('start', () => { userAdjustedView = true; });   // 이후 리사이즈 시 자동 프레이밍 중단
+
+            // Ctrl/⌘+휠(브라우저 페이지 확대·축소, 트랙패드 핀치)은 3D 카메라 줌으로 가로채지 않고
+            // 브라우저에 그대로 넘긴다. OrbitControls는 ctrlKey가 눌린 휠을 핀치로 간주해 줌 배율을
+            // 10배로 키우므로, 여기서 막지 않으면 시점이 한 번에 40% 이상 튄다.
+            document.getElementById('container').addEventListener('wheel', event => {
+                if (event.ctrlKey || event.metaKey) event.stopPropagation();
+            }, { capture: true, passive: true });
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+            scene.add(ambientLight);
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+            directionalLight.position.set(5, 5, 5);
+            directionalLight.castShadow = true;
+            scene.add(directionalLight);
+
+            const grid = new THREE.GridHelper(10, 10);
+            grid.rotation.x = Math.PI / 2;
+            scene.add(grid);
+
+            // Register loaders with LoadingManager for automatic handling
+            const manager = new THREE.LoadingManager();
+            manager.onLoad = () => {              // URDF + 모든 메시 로드 완료 시점 (그 전엔 바운딩 박스가 비어 있음)
+                if (!userAdjustedView) frameRobot();
+            };
+            const loader = new URDFLoader(manager);
+            
+            // This is the fallback for urdf-loader's internal _loadMesh
+            loader.loaders = {
+                stl: STLLoader,
+                dae: ColladaLoader,
+                obj: OBJLoader,
+                glb: GLTFLoader,
+                gltf: GLTFLoader
+            };
+
+            // Custom loadMesh function as a fallback to ensure GLB works
+            loader.loadMeshCb = (path, manager, onComplete) => {
+                const ext = path.split('.').pop().toLowerCase();
+                if (ext === 'glb' || ext === 'gltf') {
+                    const gltfLoader = new GLTFLoader(manager);
+                    gltfLoader.load(path, gltf => {
+                        onComplete(gltf.scene);
+                    }, undefined, err => {
+                        console.error('Error loading GLB:', err);
+                    });
+                } else if (ext === 'stl') {
+                    const stlLoader = new STLLoader(manager);
+                    stlLoader.load(path, geometry => {
+                        const material = new THREE.MeshStandardMaterial({ color: 0xffffff });
+                        const mesh = new THREE.Mesh(geometry, material);
+                        onComplete(mesh);
+                    });
+                } else {
+                    // Default behavior
+                    const LoaderClass = loader.loaders[ext];
+                    if (LoaderClass) {
+                        const l = new LoaderClass(manager);
+                        l.load(path, result => {
+                            onComplete(result.scene || result);
+                        });
+                    }
+                }
+            };
+
+            function createThickAxes(size) {
+                const group = new THREE.Group();
+                group.name = 'axes';
+                const radius = 0.008;
+                const height = size;
+
+                const matX = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+                const geom = new THREE.CylinderGeometry(radius, radius, height);
+
+                const x = new THREE.Mesh(geom, matX);
+                x.rotation.z = -Math.PI / 2;
+                x.position.x = height / 2;
+                group.add(x);
+
+                const matY = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+                const y = new THREE.Mesh(geom, matY);
+                y.position.y = height / 2;
+                group.add(y);
+
+                const matZ = new THREE.MeshBasicMaterial({ color: 0x0000ff });
+                const z = new THREE.Mesh(geom, matZ);
+                z.rotation.x = Math.PI / 2;
+                z.position.z = height / 2;
+                group.add(z);
+                group.children.forEach(m => { m.userData.isAxes = true; });   // 바운딩 박스 계산에서 제외 표시
+                
+                return group;
+            }
+
+            loader.load('../assets/vega_1p/vega_1p.urdf', result => {
+                robot = result;
+                // robot.rotation.x = -Math.PI / 2; // 기존에 로봇을 눕히던 회전값을 제거하여 바로 서게 함
+                
+                // Add Thick Axes to all links
+                robot.traverse(c => {
+                    if (c.isURDFLink) {
+                        const axes = createThickAxes(AXES_SIZE);
+                        axes.userData.linkName = c.name;   // applyAxesMode()에서 링크별 표시 여부 판단에 사용
+                        c.add(axes);
+                    }
+                });
+                applyAxesMode();
+                
+                scene.add(robot);
+            }, undefined, error => {
+                console.error('An error happened while loading the URDF:', error);
+            });
+
+            window.addEventListener('resize', onWindowResize, false);
+            
+            window.addEventListener('message', event => {
+                if (robot && event.data.type === 'updateJoints') {
+                    const jointValues = event.data.joints;
+                    for (const name in jointValues) {
+                        if (robot.joints[name]) {
+                            robot.joints[name].setJointValue(jointValues[name]);
+                        }
+                    }
+                }
+            });
+
+            document.getElementById('resetView').addEventListener('click', () => {
+                userAdjustedView = false;
+                frameRobot();
+            });
+
+            for (const radio of document.querySelectorAll('input[name="axesMode"]')) {
+                radio.checked = (radio.value === axesMode);
+                radio.addEventListener('change', (e) => {
+                    axesMode = e.target.value;
+                    try { localStorage.setItem(AXES_MODE_STORAGE_KEY, axesMode); } catch (e) { /* noop */ }
+                    applyAxesMode();
+                });
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setPixelRatio(window.devicePixelRatio); // 페이지 확대·축소로 DPR이 바뀌어도 선명도 유지
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            if (!userAdjustedView) frameRobot();   // 뷰어 폭이 바뀌면 로봇이 다시 중앙에 꽉 차도록
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>

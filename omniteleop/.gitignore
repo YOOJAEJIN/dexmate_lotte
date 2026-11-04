@@ -1,0 +1,31 @@
+.vscode/
+.idea/
+target/
+build/
+*~
+*.swp
+*.pyc
+*.pyo
+*.pyd
+.Python
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.tox/
+.coverage
+.cache
+.hypothesis/
+coverage.xml
+*.cover
+*.log
+.DS_Store
+Thumbs.db
+
+/src/omniteleop/app/frontend/node_modules
+/src/omniteleop/app/frontend/dist
+/src/omniteleop/app/frontend/public/assets/vega_1
+/src/omniteleop/app/frontend/public/assets/vega_1p
+
+# ========================================
+# Others
+# ========================================
