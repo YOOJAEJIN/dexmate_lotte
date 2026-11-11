@@ -21,19 +21,33 @@ Thor  omniteleop backend :5006  GET /robots/joints ─────────�
 | `webrtc_launch.py` | Thor | UDP H.264 → WebRTC 릴레이. `SEG_TAP_PORT` 설정 시 디코드 프레임을 zmq로 공개 |
 | `nano/gstsender.py` | nano (`~/gstsender/`) | ZED 송출. 기존 3 스트림 + **실측 depth TCP 55703** 추가 |
 
-## 실행 순서
+## 실행
 
-1. **nano**: `cd ~ && ROBOT_NAME=<robot> setsid nohup python gstsender/gstsender.py > /tmp/gstsender.log 2>&1 &`
-   — SIGINT를 무시하므로 종료는 `kill <pid>`(SIGTERM).
-2. **Thor 릴레이** (6개): 60001만 프레임 탭을 켠다. 모든 포트에 같은 `SEG_TAP_PORT`를 주면 bind 충돌로 릴레이가 프레임을 못 받는다.
-   ```bash
-   SEG_TAP_PORT=55601 python webrtc_launch.py --http-port 60001 --udp-port 50001 &
-   for n in 2 3 4 5 6; do python webrtc_launch.py --http-port 6000$n --udp-port 5000$n & done
-   ```
-   인증서: 기본 `/home/dexmate/certs/{cert,key}.pem`, 또는 `--cert/--key`, `XR_TELEOP_CERT/XR_TELEOP_KEY`.
-3. **omniteleop GUI**: `omniteleop/src/omniteleop/app/launch.sh`. GUI를 릴레이와 다른 PC에서 띄우면 `CAM_HOST=<로봇 IP>` (vite가 `/cam/<port>/`로 중계하므로 브라우저 인증서 수락 불필요).
-4. **seg_overlay**: `python vision/seg_overlay.py` — torch(CUDA) · ultralytics · opencv · pyzmq · pinocchio(`pip install pin`) 필요. 가중치 `FastSAM-s.pt`는 첫 실행 시 자동 다운로드.
-   teleop 실행 중이면 좌표가 베이스(B), 아니면 카메라(C) 기준.
+GUI(`omniteleop/src/omniteleop/app/launch.sh`)를 띄운 뒤:
+
+```bash
+vision/start_head_seg.sh
+```
+
+nano 송출기 → Thor 릴레이 6개 → seg_overlay 순서로 띄운다. 이미 떠 있는 부분은 건너뛰므로 여러 번 실행해도 안전하고,
+부팅 직후 nano가 늦게 올라와도 최대 3분 기다린다. 로그는 `vision/logs/`.
+
+부팅 시 자동 실행 (`crontab -e`에 한 줄):
+
+```
+@reboot <repo>/vision/start_head_seg.sh >> <repo>/vision/logs/autostart.log 2>&1
+```
+
+경로 기본값은 vega-1p 로봇 기준이며 `NANO`, `NANO_PY`, `NANO_SENDER`, `RELAY_PY`, `SEG_PY` 환경변수로 바꾼다.
+nano 쪽 `gstsender.py`는 `vision/nano/gstsender.py`를 nano의 `~/gstsender/`에 둔다.
+
+수동으로 다룰 때 주의:
+- nano 송출기는 SIGINT를 무시하므로 종료는 `kill <pid>`(SIGTERM). `pgrep -f gstsender`는 ssh로 띄울 때 생긴 `bash -c` 래퍼도 잡으니, 실제 python pid인지 확인한다.
+- 릴레이의 `SEG_TAP_PORT`는 60001에만 준다. 모든 포트에 같은 값을 주면 bind 충돌로 탭이 동작하지 않는다.
+- 릴레이 인증서: 기본 `/home/dexmate/certs/{cert,key}.pem`, 또는 `--cert/--key`, `XR_TELEOP_CERT/XR_TELEOP_KEY`.
+- GUI를 릴레이와 다른 PC에서 띄우면 `CAM_HOST=<로봇 IP>` (vite가 `/cam/<port>/`로 중계하므로 브라우저 인증서 수락 불필요).
+- seg_overlay는 torch(CUDA) · ultralytics · opencv · pyzmq · pinocchio(`pip install pin`) 필요. `FastSAM-s.pt`는 없으면 자동 다운로드.
+- GUI에서 teleop **Start** 중이면 좌표가 베이스(B), 아니면 카메라(C) 기준 — 관절값을 teleop 스택의 `robot_controller`가 publish하기 때문.
 
 결과는 화면 오버레이와 `vision/logs/box_coords.json`(2초마다: 상자별 bbox · corners · layers · grasp)로 나온다.
 
