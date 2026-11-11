@@ -61,7 +61,7 @@ export const RobotStatus: React.FC<RobotStatusProps> = ({observations}) => {
         <iframe
           ref={iframeRef}
           src="/assets/urdf_viewer.html"
-          className="w-full h-[520px] border-none block"
+          className="w-full h-[46vh] min-h-[320px] border-none block"
           title="Robot Status URDF Viewer"
         />
       </CardContent>

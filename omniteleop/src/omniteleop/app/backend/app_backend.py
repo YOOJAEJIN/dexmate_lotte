@@ -959,6 +959,21 @@ class TeleopApp:
                     logger.error(f"Hardware estop clear failed: {exc}")
             return JSONResponse(content=await build_state_dict())
 
+        @app.get("/robots/joints")
+        async def robots_joints():
+            """Current joint positions from the robot/joints feedback cache.
+
+            Same source as reach; available only while the teleop stack runs.
+            Used by the seg overlay service for camera-to-base FK.
+            """
+            joints = self._get_reach_joints()
+            if joints is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="joint states unavailable — teleop stack not running",
+                )
+            return joints
+
         # -- WebSocket endpoints --------------------------------------------
         @app.websocket("/ws")
         async def ws(websocket: WebSocket):

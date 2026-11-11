@@ -154,9 +154,10 @@ image:
     #ip: "127.0.0.1"
     #ip: "192.168.123.59"
     ip: "192.168.123.7"
-    port: [60001, 60002, 60003, 60004, 60005]
+    port: [60001, 60002, 60003, 60004, 60005, 60006]
+    # 60006 = head camera + FastSAM segmentation overlay (vision/seg_overlay.py)
     # position is: head_left_rgb, head_right_rgb, head_depth, left_wrist_rgb, right_wrist_rgb
-    position: ["head_left_rgb", "head_right_rgb", "head_depth", "left_wrist_rgb", "right_wrist_rgb"]
+    position: ["head_left_rgb", "head_right_rgb", "head_depth", "left_wrist_rgb", "right_wrist_rgb", "head_seg"]
 
 topics:
   exo_joints: "exo/joints"

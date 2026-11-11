@@ -11,7 +11,7 @@ import { ObservationPanel } from './components/ObservationPanel.tsx'
 import { ActionPanel } from './components/ActionPanel'
 import { ArmControl } from './components/ArmControl'
 import { TorsoControl } from './components/TorsoControl'
-import { ChassisControl } from './components/ChassisControl'
+import { GripperControl } from './components/GripperControl'
 import { PredefinedPoseControl } from './components/PredefinedPoseControl'
 import {ReachControl} from "./components/ReachControl.tsx";
 import { DebugPanel } from './components/DebugPanel'
@@ -31,7 +31,9 @@ function persist(key: string, value: string) {
 }
 
 export default function App() {
-  const [apiUrl, setApiUrl]     = useState(() => loadPersisted('apiUrl', DEFAULT_API))
+  // Always follow the host the page was opened from; a persisted apiUrl from a
+  // previous session (different IP / localhost) causes "Load Failed" errors.
+  const [apiUrl, setApiUrl]     = useState(DEFAULT_API)
   const [apiInput, setApiInput] = useState(apiUrl)
   const [isActive, setIsActive] = useState(true)
   const [configError, setConfigError] = useState<string | null>(null)
@@ -82,17 +84,20 @@ export default function App() {
     } catch { /* invalid URL – pass through and let the connection fail gracefully */ }
     setApiUrl(trimmed)
     setApiInput(trimmed)
-    persist('apiUrl', trimmed)
   }
 
-  async function api(method: string, path: string, body?: unknown) {
-    setLoading(true)
+  // showLoading=false for background reads: the full-screen loading overlay
+  // blocks every click, and /config alone takes ~5s (dextop topic discovery).
+  async function api(method: string, path: string, body?: unknown, showLoading = true) {
+    if (showLoading) setLoading(true)
     setActionError(null)
     try {
       const res = await fetch(`${apiUrl}${path}`, {
         method,
         headers: body ? { 'Content-Type': 'application/json' } : {},
         body: body ? JSON.stringify(body) : undefined,
+        // Guard: AbortSignal.timeout is missing on Safari < 16
+        signal: typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(20000) : undefined,
       })
       if (!res.ok) {
         const text = await res.text()
@@ -107,12 +112,12 @@ export default function App() {
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e))
     } finally {
-      setLoading(false)
+      if (showLoading) setLoading(false)
     }
   }
 
   const fetchState = async () => {
-    const data = await api('GET', '/state')
+    const data = await api('GET', '/state', undefined, false)
     if (data) {
       setIsRecording(data.is_recording)
       setTeleopRunning(data.teleop_running)
@@ -148,7 +153,7 @@ export default function App() {
   const handleClearEstop   = async () => await api('DELETE', '/robots/estop')
 
   const fetchConfig = async () => {
-    const data = await api('GET', '/config') as ConfigResponse
+    const data = await api('GET', '/config', undefined, false) as ConfigResponse
     if (data) {
       if (data.result === 'fail') {
         setIsActive(false)
@@ -273,25 +278,21 @@ export default function App() {
             <Card className="overflow-hidden border-border shadow-md">
               <CardHeader className="py-2.5 px-4 bg-gray-700 text-primary-foreground flex flex-row items-center justify-between space-y-0">
                 <CardTitle className="text-xs font-bold tracking-tight text-primary-foreground normal-case">WebRTC Streams</CardTitle>
-                <a
-                  href={`https://${config?.ip || window.location.hostname}:${config?.port?.[0] || 60001}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-[10px] font-bold text-sky-200 hover:text-white transition-colors flex items-center gap-1"
-                >
-                  Authorize <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
-                </a>
               </CardHeader>
               {/* 스트림이 많아도 페이지가 길어지지 않도록 카드 안에서만 세로 스크롤 (뷰포트 높이 기준) */}
               <CardContent className="p-3 bg-muted/30 dark:bg-zinc-900/50 flex flex-col gap-3 overflow-y-auto max-h-[calc(100vh-7rem)]">
-                {(config?.port || []).map((port, idx) => (
+                {(config?.port || [])
+                  .map((port, idx) => ({ port, pos: config?.position?.[idx] || `Camera ${idx + 1}` }))
+                  // Head cameras are a stereo pair; one view is enough in the UI.
+                  .filter(({ pos }) => pos !== 'head_right_rgb')
+                  .map(({ port, pos }, idx) => (
                   <div key={port} className="flex flex-col gap-1.5">
                     <h6 className="text-[10px] font-bold text-muted-foreground/80 uppercase tracking-widest pl-1">
-                      {config?.position?.[idx]?.replace(/_/g, ' ') || `Camera ${idx + 1}`}
+                      {(pos === 'head_left_rgb' ? 'head camera' : pos).replace(/_/g, ' ')}
                     </h6>
                     <div className="relative aspect-[4/3] w-full bg-black rounded-lg overflow-hidden border border-border shadow-inner group">
                       <iframe
-                        src={`https://${config?.ip || window.location.hostname}:${port}`}
+                        src={`/cam/${port}/`}
                         className="w-full h-full border-0 block overflow-hidden"
                         title={`camera-${idx}`}
                         scrolling="no"
@@ -305,6 +306,24 @@ export default function App() {
 
           {/* Middle Column: Controls (21/42) */}
           <div className="flex flex-col gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <ArmControl apiUrl={apiUrl} disabled={!teleopRunning} />
+              <TorsoControl apiUrl={apiUrl} disabled={!teleopRunning} />
+              <GripperControl apiUrl={apiUrl} disabled={!teleopRunning} />
+            </div>
+            <PredefinedPoseControl apiUrl={apiUrl} disabled={!teleopRunning} />
+            <ReachControl apiUrl={apiUrl} disabled={!teleopRunning} />
+            <ObservationPanel observations={teleopRunning ? state.observations : {}} accentColor="bg-emerald-800" />
+            <ActionPanel
+              title="Action Command"
+              actions={teleopRunning ? state.actions : {}}
+              accentColor="bg-emerald-800"
+            />
+          </div>
+
+          {/* Right Column: Robot Status / Teleop Controls (12/42) */}
+          <div className="grid grid-cols-1 gap-4 items-start">
+            <RobotStatus observations={state.observations} />
             {/* Teleop Controls */}
             <TeleopControls
               teleopRunning={teleopRunning}
@@ -322,25 +341,6 @@ export default function App() {
               onResetAll={handleResetAll}
               onEstop={handleEstop}
               onClearEstop={handleClearEstop}
-            />
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <ArmControl apiUrl={apiUrl} disabled={!teleopRunning} />
-              <TorsoControl apiUrl={apiUrl} disabled={!teleopRunning} />
-              <ChassisControl apiUrl={apiUrl} disabled={!teleopRunning} />
-            </div>
-            <PredefinedPoseControl apiUrl={apiUrl} disabled={!teleopRunning} />
-            <ReachControl apiUrl={apiUrl} disabled={!teleopRunning} />
-          </div>
-
-          {/* Right Column: Robot Status / Observation / Action (12/42) */}
-          <div className="grid grid-cols-1 gap-4 items-start">
-            <RobotStatus observations={state.observations} />
-
-            <ObservationPanel observations={teleopRunning ? state.observations : {}} accentColor="bg-emerald-800" />
-            <ActionPanel
-              title="Action Command"
-              actions={teleopRunning ? state.actions : {}}
-              accentColor="bg-emerald-800"
             />
           </div>
 

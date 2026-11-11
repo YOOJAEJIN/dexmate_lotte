@@ -28,10 +28,6 @@ export const PredefinedPoseControl: React.FC<PredefinedPoseControlProps> = ({ ap
   const poses = [
     { id: 'home', label: 'Home', image: 'home.png', description: 'Arm + Head + Torso' },
     { id: 'l_pose', label: 'L Pose', image: 'l_pose.png', description: 'Arm + Head + Torso' },
-    { id: 'pantos_pick', label: 'Pantos Pick', image: 'pantos_pick.png', description: 'Arm + Head + Torso' },
-    { id: 'pantos_place', label: 'Pantos Place', image: 'pantos_place.png', description: 'Arm + Head + Torso' },
-    { id: 'object', label: 'Object', image: 'object.png', description: 'Head + Torso' },
-    { id: 'libero', label: 'Libero', image: 'libero.png', description: 'Head + Torso' },
   ];
 
   return (
