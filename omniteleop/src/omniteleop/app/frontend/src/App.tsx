@@ -306,10 +306,13 @@ export default function App() {
 
           {/* Middle Column: Controls (21/42) */}
           <div className="flex flex-col gap-4">
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <ArmControl apiUrl={apiUrl} disabled={!teleopRunning} />
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {/* Arm over Gripper, equal halves; together as tall as Torso & Head */}
+              <div className="flex flex-col gap-4">
+                <div className="flex-1"><ArmControl apiUrl={apiUrl} disabled={!teleopRunning} /></div>
+                <div className="flex-1"><GripperControl apiUrl={apiUrl} disabled={!teleopRunning} /></div>
+              </div>
               <TorsoControl apiUrl={apiUrl} disabled={!teleopRunning} />
-              <GripperControl apiUrl={apiUrl} disabled={!teleopRunning} />
             </div>
             <PredefinedPoseControl apiUrl={apiUrl} disabled={!teleopRunning} />
             <ReachControl apiUrl={apiUrl} disabled={!teleopRunning} />

@@ -34,7 +34,7 @@ export const GripperControl: React.FC<GripperControlProps> = ({ apiUrl, disabled
   const sideControls = (side: GripperSide) => (
     <>
       <SectionLabel className="w-full self-stretch capitalize">{side} Gripper</SectionLabel>
-      <div className="grid grid-cols-2 gap-2 w-full">
+      <div className="grid grid-cols-2 gap-2 w-full flex-1 min-h-10">
         <button
           onClick={() => void sendPose('close', side)}
           disabled={disabled}
@@ -58,11 +58,11 @@ export const GripperControl: React.FC<GripperControlProps> = ({ apiUrl, disabled
   );
 
   return (
-    <Card className="border-border shadow-md overflow-hidden">
+    <Card className="border-border shadow-md overflow-hidden h-full flex flex-col">
       <CardHeader className="py-2.5 px-4 bg-orange-700 text-white">
         <CardTitle className="text-xs font-bold tracking-tight text-white normal-case">Gripper Control</CardTitle>
       </CardHeader>
-      <CardContent className="p-4 flex flex-col items-center gap-3">
+      <CardContent className="p-3 flex-1 flex flex-col items-center gap-2">
         {sideControls('left')}
         {sideControls('right')}
       </CardContent>
