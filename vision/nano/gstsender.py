@@ -49,6 +49,27 @@ class GstSender:
 
 
 ############################################################
+# SINGLE INSTANCE (2026-11-12)
+# A 2nd sender steals the ZED from the first, which then fails every grab yet
+# keeps serving its last depth frame (and IMU garbage). Claim the metric-depth
+# port BEFORE touching the camera: if it is taken, a sender is already running.
+############################################################
+import os
+import socket
+
+METRIC_DEPTH_PORT = 55703
+GRAB_FAIL_EXIT_S = 15  # no frame this long -> exit, freeing camera + port for a restart
+
+_depth_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+_depth_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    _depth_srv.bind(("0.0.0.0", METRIC_DEPTH_PORT))
+    _depth_srv.listen(4)  # listen now: a merely-bound REUSEADDR port doesn't block a 2nd bind
+except OSError:
+    print(f"gstsender already running (port {METRIC_DEPTH_PORT} in use) - exiting", flush=True)
+    raise SystemExit(1)
+
+############################################################
 # ZED X MINI
 ############################################################
 
@@ -85,12 +106,10 @@ print("ZED X MINI STREAMING STARTED")
 # with the scene; this channel carries retrieve_measure(DEPTH) values.
 # Frame: struct ">HHI" (w, h, nbytes) + little-endian uint16 mm, 0 = invalid.
 ############################################################
-import socket
 import struct
 import threading
 import numpy as np
 
-METRIC_DEPTH_PORT = 55703
 METRIC_DEPTH_EVERY = 3  # every Nth grab (~10 Hz at 30 fps)
 measure_mat = sl.Mat()
 _unit_to_mm = {sl.UNIT.MILLIMETER: 1.0, sl.UNIT.CENTIMETER: 10.0,
@@ -117,10 +136,7 @@ def _depth_client(conn):
 
 
 def _depth_server():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", METRIC_DEPTH_PORT))
-    srv.listen(4)
+    srv = _depth_srv  # bound + listening since startup (single-instance lock)
     while True:
         conn, _ = srv.accept()
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -130,6 +146,104 @@ def _depth_server():
 threading.Thread(target=_depth_server, daemon=True).start()
 print(f"METRIC DEPTH TCP SERVER :{METRIC_DEPTH_PORT} (unit->mm x{_unit_to_mm})")
 _frame_i = 0
+
+
+############################################################
+# HEAD IMU -> zenoh  (added 2026-11-11, backup: gstsender.py.bak_20261111_preimu)
+# dexsensor-compatible: {ROBOT_NAME}/sensors/head_camera/imu, IMUDataCodec
+#   acc [m/s^2], gyro [rad/s] (ZED gives deg/s), quat [w, x, y, z], timestamp_ns
+# Read in its own thread with TIME_REFERENCE.CURRENT (ZED SDK allows this
+# next to grab()). Any failure here only disables the IMU, never the video.
+# Needs dexcomm>=0.6.0 in this python. Disable with GSTSENDER_IMU=0.
+############################################################
+import os
+import math
+
+IMU_TOPIC = "sensors/head_camera/imu"
+IMU_HZ = 200.0
+
+
+def _imu_robot_name():
+    name = os.environ.get("ROBOT_NAME", "")
+    if name:
+        return name
+    # thor launches this over a non-login ssh shell -> no ROBOT_NAME in env
+    try:
+        with open("/etc/environment.d/99-dexmate-robot.conf") as f:
+            for line in f:
+                if line.strip().startswith("ROBOT_NAME="):
+                    name = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    os.environ["ROBOT_NAME"] = name
+                    return name
+    except OSError:
+        pass
+    return ""
+
+
+def _imu_pub():
+    try:
+        robot = _imu_robot_name()
+        if not robot:
+            print("[imu] disabled: no ROBOT_NAME", flush=True)
+            return
+        if not (os.environ.get("ZENOH_CONFIG") or os.environ.get("DM_COMM_CONFIG")):
+            cand = os.path.expanduser(f"~/.dexmate/comm/zenoh/{robot.replace('/', '_')}.dzcfg")
+            if os.path.exists(cand):
+                os.environ["ZENOH_CONFIG"] = cand
+        from dexcomm import Node
+        from dexcomm.codecs import IMUDataCodec
+        node = Node(name="gstsender_head_imu")
+        pub = node.create_publisher(IMU_TOPIC, encoder=IMUDataCodec.encode)
+    except Exception as e:
+        print(f"[imu] disabled: {type(e).__name__}: {e}", flush=True)
+        return
+    print(f"[imu] publishing {robot}/{IMU_TOPIC} @ {IMU_HZ:.0f} Hz "
+          f"(config={os.environ.get('ZENOH_CONFIG', 'default')})", flush=True)
+    sd = sl.SensorsData()
+    period = 1.0 / IMU_HZ
+    d2r = math.pi / 180.0
+    last_ts = None
+    n_err = 0
+    n_pub = 0
+    t_next = time.monotonic()
+    t_report = t_next + 10.0
+    while True:
+        t_next += period
+        try:
+            if zed.get_sensors_data(sd, sl.TIME_REFERENCE.CURRENT) == sl.ERROR_CODE.SUCCESS:
+                imu = sd.get_imu_data()
+                ts = imu.timestamp.get_nanoseconds()
+                if ts != last_ts:
+                    last_ts = ts
+                    g = imu.get_angular_velocity()
+                    a = imu.get_linear_acceleration()
+                    q = imu.get_pose().get_orientation().get()  # ZED order [x, y, z, w]
+                    pub.publish({
+                        "acc": [float(a[0]), float(a[1]), float(a[2])],
+                        "gyro": [float(g[0]) * d2r, float(g[1]) * d2r, float(g[2]) * d2r],
+                        "quat": [float(q[3]), float(q[0]), float(q[1]), float(q[2])],
+                        "timestamp_ns": int(ts) if ts else time.time_ns(),
+                    })
+                    n_pub += 1
+        except Exception as e:
+            n_err += 1
+            if n_err in (1, 10, 100) or n_err % 1000 == 0:
+                print(f"[imu] error #{n_err}: {type(e).__name__}: {e}", flush=True)
+        now = time.monotonic()
+        if now >= t_report:
+            if n_pub == 0:
+                print("[imu] warning: 0 samples in last 10 s", flush=True)
+            n_pub = 0
+            t_report = now + 10.0
+        dt = t_next - now
+        if dt > 0:
+            time.sleep(dt)
+        else:
+            t_next = now
+
+
+if os.environ.get("GSTSENDER_IMU", "1") != "0":
+    threading.Thread(target=_imu_pub, daemon=True, name="imu_pub").start()
 
 
 # ############################################################
@@ -196,13 +310,20 @@ _frame_i = 0
 # MAIN LOOP
 ############################################################
 
+_last_ok = time.monotonic()
+
 while True:
 
     ########################################################
     # ZED X MINI
     ########################################################
 
-    if zed.grab(runtime) == sl.ERROR_CODE.SUCCESS:
+    if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+        if time.monotonic() - _last_ok > GRAB_FAIL_EXIT_S:
+            print(f"ZED grab failing for {GRAB_FAIL_EXIT_S}s - exiting", flush=True)
+            os._exit(1)  # daemon threads / gst children go down with us
+    else:
+        _last_ok = time.monotonic()
 
         zed.retrieve_image(left_mat, sl.VIEW.LEFT)
         zed.retrieve_image(right_mat, sl.VIEW.RIGHT)

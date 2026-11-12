@@ -3,18 +3,22 @@
 
   relay 60001 RGB tap (zmq 55601) ─┬─ every SCAN_S: FastSAM full frame
   nano metric depth (TCP 55703, mm) ┘   -> box candidates (area/border/depth)
-  backend /robots/joints (poll)    ──> pinocchio FK -> T(base<-zed_left_camera)
+  zenoh sensors/head_camera/imu    ──> gravity in the camera frame
+  zenoh robot/joints (fresh only)  ──> pinocchio FK -> T(base<-zed_left_camera)
 
-  per scan : each box -> centroid px + depth -> camera XYZ -> BASE XYZ
-             focus = extreme points of all boxes, padded to the frame aspect
-             corners (hull diagonals), 6.1 cm layer lines down both edges,
+  per scan : each box -> front face = vertical plane (gravity) -> rectangle
+             -> 4 corners, width/height, 6.1 cm layer lines down both edges,
              grasp = centre of the top 20-sheet bundle -> logs/box_coords.json
+             (box size and layers need only camera + IMU, so they do not
+             depend on the torso/head posture; BASE XYZ needs live joints)
+             focus = extreme points of all boxes, padded to the frame aspect
   per frame: bicubic zoom to focus -> FastSAM overlay -> markers/labels
              -> x264 RTP udp 50006 -> relay 60006 -> GUI tile "head seg"
 
 Needs a python with torch(CUDA) + ultralytics + opencv + pyzmq + pinocchio
 (`pip install pin`). See README.md for the full setup.
 """
+import copy
 import json
 import os
 from pathlib import Path
@@ -25,7 +29,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.request
 
 import cv2
 import numpy as np
@@ -41,7 +44,11 @@ PORT = int(os.getenv("SEG_PORT", "50006"))
 MODEL = os.getenv("SEG_MODEL", "FastSAM-s.pt")
 CONF = float(os.getenv("SEG_CONF", "0.4"))
 SCAN_S = float(os.getenv("SEG_SCAN_S", "2.0"))
-JOINTS_URL = os.getenv("SEG_JOINTS_URL", "http://127.0.0.1:5006/robots/joints")
+# Live robot feeds over zenoh (dexcomm; needs ROBOT_NAME + ZENOH_CONFIG in the env).
+IMU_TOPIC = os.getenv("SEG_IMU_TOPIC", "sensors/head_camera/imu")  # nano gstsender, ~140 Hz
+JOINTS_TOPIC = os.getenv("SEG_JOINTS_TOPIC", "robot/joints")       # robot_controller, 100 Hz
+FEED_MAX_AGE_S = 1.0  # older than this = dead feed, never reuse (2026-11-12: a cached
+                      # pose from a crashed robot_controller put the camera 22 deg off)
 _HERE = Path(__file__).resolve().parent
 COORDS_JSON = os.getenv("SEG_COORDS_JSON", str(_HERE / "logs" / "box_coords.json"))
 URDF = os.getenv(
@@ -69,7 +76,7 @@ PITCH = float(os.getenv("SEG_PITCH", "0.061"))
 
 def project(p_cam):
     """Camera-frame 3D point -> pixel (u, v)."""
-    return [int(FX * p_cam[0] / p_cam[2] + CX), int(FY * p_cam[1] / p_cam[2] + CY)]
+    return [int(round(FX * p_cam[0] / p_cam[2] + CX)), int(round(FY * p_cam[1] / p_cam[2] + CY))]
 
 
 def layer_lines(corners_cam, T):
@@ -111,6 +118,31 @@ def layer_lines(corners_cam, T):
 from ultralytics import FastSAM, YOLO  # noqa: E402
 import pinocchio as pin  # noqa: E402
 
+import box_hold  # noqa: E402
+import face_plane  # noqa: E402
+
+_held = None  # last unoccluded grasp box (box_hold)
+
+
+def reproject(box, T):
+    """Pixel positions of a held box for the current head pose."""
+    if T is None or box["xyz_base"] is None:
+        return box  # ponytail: camera-frame hold assumes the head hasn't moved
+    Ti = T.inverse()
+    px = lambda xyz: project(Ti.act(np.array(xyz)))  # noqa: E731
+    b = copy.deepcopy(box)
+    for k in b["corners"]:
+        k["px"] = px(k["xyz"])
+    for L in b["layers"]:
+        for s in ("left", "right"):
+            L[s]["px"] = px(L[s]["xyz"])
+    if b["grasp"]:
+        b["grasp"]["px"] = px(b["grasp"]["xyz"])
+    b["c"] = tuple(px(b["xyz_base"]))
+    us, vs = zip(*(k["px"] for k in b["corners"]))
+    b["bbox"] = (min(us), min(vs), max(us), max(vs))
+    return b
+
 Path(COORDS_JSON).parent.mkdir(parents=True, exist_ok=True)
 model = (FastSAM if "fastsam" in MODEL.lower() else YOLO)(MODEL)
 
@@ -125,25 +157,59 @@ _JOINT_GROUPS = {
     "head": [f"head_j{i+1}" for i in range(3)],
 }
 
-_joints_cache, _joints_t = None, 0.0
+_feed_lock = threading.Lock()
+_imu = []                           # (t_rx, acc[3]) of the last ~0.5 s
+_joints = {"t": 0.0, "q": None}     # latest robot/joints message
+_link = {}                          # keeps the node + subscribers alive
+
+
+def _on_imu(m):
+    try:
+        a = np.asarray(m["acc"], float).reshape(3)
+    except Exception:
+        return
+    now = time.time()
+    with _feed_lock:
+        _imu.append((now, a))
+        while _imu and now - _imu[0][0] > 0.5:
+            _imu.pop(0)
+
+
+def _on_joints(m):
+    j = m.get("joints", m) if isinstance(m, dict) else None
+    if isinstance(j, dict):
+        with _feed_lock:
+            _joints["t"], _joints["q"] = time.time(), j
+
+
+def _robot_link():
+    """Subscribe in the background: a missing zenoh setup must never stall the video."""
+    try:
+        from dexcomm import Node
+        from dexcomm.codecs import DictDataCodec, IMUDataCodec
+        node = Node(name="seg_overlay")
+        _link["subs"] = [node.create_subscriber(IMU_TOPIC, _on_imu, decoder=IMUDataCodec.decode),
+                         node.create_subscriber(JOINTS_TOPIC, _on_joints, decoder=DictDataCodec.decode)]
+        _link["node"] = node
+        print(f"[seg] robot link up: {node.resolve_topic(IMU_TOPIC)}, {node.resolve_topic(JOINTS_TOPIC)}", flush=True)
+    except Exception as e:
+        print(f"[seg] robot link disabled ({type(e).__name__}: {e}) - no gravity / base frame", flush=True)
+
+
+threading.Thread(target=_robot_link, daemon=True).start()
 
 
 def cam_to_base_T():
-    """T(base <- optical camera) from live joints, or None if unavailable."""
-    global _joints_cache, _joints_t
-    if time.time() - _joints_t > 0.5:
-        try:
-            with urllib.request.urlopen(JOINTS_URL, timeout=1.5) as r:
-                _joints_cache = json.load(r)
-        except Exception:
-            _joints_cache = _joints_cache  # keep stale joints if poll fails
-        _joints_t = time.time()
-    if not _joints_cache:
+    """T(base <- optical camera) from LIVE joints, or None (stale / no feed)."""
+    with _feed_lock:
+        fresh = time.time() - _joints["t"] < FEED_MAX_AGE_S
+        joints = _joints["q"] if fresh else None
+    if not joints:
         return None
     q = pin.neutral(pin_model)
     for group, names in _JOINT_GROUPS.items():
-        vals = _joints_cache.get(group)
-        if not vals:
+        vals = joints.get(group)
+        if vals is None or len(vals) == 0:
             continue
         for jname, val in zip(names, vals):
             jid = pin_model.getJointId(jname)
@@ -151,6 +217,22 @@ def cam_to_base_T():
     q = np.clip(q, pin_model.lowerPositionLimit, pin_model.upperPositionLimit)
     pin.framesForwardKinematics(pin_model, pin_data, q)
     return pin_data.oMf[CAM_FRAME] * pin.SE3(R_CORR, np.zeros(3))
+
+
+def gravity_up(T):
+    """(world-up in the camera frame, source). Head IMU first: it sits in the camera,
+    so it is right whatever the torso / head joints or the URDF say; FK is the fallback."""
+    with _feed_lock:
+        acc = [a for _, a in _imu]
+        last = _imu[-1][0] if _imu else 0.0
+    if len(acc) >= 5 and time.time() - last < FEED_MAX_AGE_S:
+        g = np.mean(acc, axis=0)
+        gn = float(np.linalg.norm(g))
+        if 9.0 < gn < 10.6:  # at rest the accelerometer reads +g along up
+            return g / gn, "IMU"
+    if T is not None:
+        return T.rotation.T @ np.array([0.0, 0.0, 1.0]), "FK"
+    return None, "-"
 
 
 ctx = zmq.Context()
@@ -176,6 +258,7 @@ def _depth_reader():
         try:
             with socket.create_connection((host, int(port)), timeout=5) as s:
                 f = s.makefile("rb")
+                first = True
                 while True:
                     hdr = f.read(8)
                     if len(hdr) < 8:
@@ -184,6 +267,12 @@ def _depth_reader():
                     buf = f.read(n)
                     if len(buf) < n:
                         break
+                    # The sender hands out its latest frame on connect - which
+                    # is ancient if its grab loop died (camera taken by a 2nd
+                    # sender, 2026-11-12). Trust only frames that keep coming.
+                    if first:
+                        first = False
+                        continue
                     _depth_latest = np.frombuffer(buf, dtype="<u2").reshape(h, w)
         except OSError:
             pass
@@ -256,13 +345,50 @@ def fit_aspect(x0, y0, x1, y1, w, h, margin=0.06):
     return (max(0, int(x0)), max(0, int(y0)), min(w, int(x1)), min(h, int(y1)))
 
 
+def _free_face(m, depth_img, cu, cv_, z):
+    """Fallback without gravity: free plane through the mask + extreme hull points.
+
+    View-dependent: from above, the top face is in the mask and counts as
+    height. -> (centre, corners ordered BR, BL, TL, TR), all camera frame.
+    """
+    vv, uu = np.nonzero(cv2.erode(m, np.ones((5, 5), np.uint8)))
+    zz = depth_img[vv, uu].astype(np.float32) / 1000.0
+    ok = (zz > DEPTH_VALID[0]) & (zz < DEPTH_VALID[1])
+    uu, vv, zz = uu[ok], vv[ok], zz[ok]
+    plane = face_plane.fit(np.stack([(uu - CX) * zz / FX, (vv - CY) * zz / FY, zz], 1))
+
+    def on_face(u, v, fallback_z):
+        ray = np.array([(u - CX) / FX, (v - CY) / FY, 1.0])
+        p = face_plane.ray_hit(ray, plane) if plane is not None else None
+        if p is None or not (DEPTH_VALID[0] < p[2] < DEPTH_VALID[1]):
+            p = ray * fallback_z
+        return p
+
+    pts = []
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
+        hull = cv2.convexHull(max(cnts, key=cv2.contourArea)).reshape(-1, 2)
+        # Extreme hull points along the 4 diagonals. Unlike minAreaRect this
+        # keeps the perspective trapezoid of a face seen at an angle.
+        for dx, dy in ((1, 1), (-1, 1), (-1, -1), (1, -1)):
+            px, py = hull[np.argmax(hull[:, 0] * dx + hull[:, 1] * dy)].astype(float)
+            su, sv = int(0.85 * px + 0.15 * cu), int(0.85 * py + 0.15 * cv_)
+            pts.append(on_face(px, py, depth_at(depth_img, su, sv) or z))
+    return on_face(cu, cv_, z), pts
+
+
+_grav_src = "-"  # where the last scan's gravity came from (shown on the overlay)
+
+
 def scan(frame, depth_img):
     """FastSAM full frame -> box candidates with camera+base XYZ, focus bbox."""
     h, w = frame.shape[:2]
     res = model(frame, verbose=False, device=0, conf=CONF, retina_masks=True)[0]
     if res.boxes is None or res.masks is None:
         return None, []
+    global _grav_src
     T = cam_to_base_T()
+    up, _grav_src = gravity_up(T)
     cands = []
     for box, mask in zip(res.boxes, res.masks.data):
         x0, y0, x1, y1 = [int(v) for v in box.xyxy[0]]
@@ -287,34 +413,34 @@ def scan(frame, depth_img):
         z = depth_at(depth_img, cu, cv_)
         if z is None:
             continue
-        xyz_cam = np.array([(cu - CX) * z / FX, (cv_ - CY) * z / FY, z])
-        xyz_base = T.act(xyz_cam).tolist() if T is not None else None
-
-        # Box face corners from the mask's min-area rectangle. Depth is
-        # sampled slightly inside each corner (edges have mixed depth).
-        corners = []
         m = mask.cpu().numpy().astype(np.uint8)
         if m.shape != frame.shape[:2]:
             m = cv2.resize(m, (w, h))
-        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if cnts:
-            hull = cv2.convexHull(max(cnts, key=cv2.contourArea)).reshape(-1, 2)
-            # Extreme hull points along the 4 diagonals (BR, BL, TL, TR). Unlike
-            # minAreaRect this keeps the perspective trapezoid: with the head
-            # looking down, the farther bottom edge is shorter in pixels.
-            for dx, dy in ((1, 1), (-1, 1), (-1, -1), (1, -1)):
-                px, py = hull[np.argmax(hull[:, 0] * dx + hull[:, 1] * dy)].astype(float)
-                su, sv = int(0.85 * px + 0.15 * cu), int(0.85 * py + 0.15 * cv_)
-                cz = depth_at(depth_img, su, sv) or z
-                c_cam = np.array([(px - CX) * cz / FX, (py - CY) * cz / FY, cz])
-                c_abs = T.act(c_cam).tolist() if T is not None else c_cam.tolist()
-                corners.append({"px": [int(px), int(py)], "xyz": c_abs,
-                                "cam": c_cam.tolist()})
+        pts = None
+        if up is not None:
+            # Upright pile + gravity: the front face is a vertical plane and the
+            # box a rectangle on it - same result from any camera height / tilt.
+            vv, uu = np.nonzero(m)
+            zz = depth_img[vv, uu].astype(np.float32) / 1000.0
+            zz[(zz <= DEPTH_VALID[0]) | (zz >= DEPTH_VALID[1])] = 0
+            rays = np.stack([(uu - CX) / FX, (vv - CY) / FY, np.ones(len(uu))], axis=1)
+            face = face_plane.rect(rays, zz, up, z / FX)
+            if face is not None:
+                pts, xyz_cam = list(face[0]), face[0].mean(axis=0)
+        if pts is None:
+            xyz_cam, pts = _free_face(m, depth_img, cu, cv_, z)
+        xyz_base = T.act(xyz_cam).tolist() if T is not None else None
+        corners = [{"px": project(c), "xyz": (T.act(c) if T is not None else c).tolist(),
+                    "cam": c.tolist()} for c in pts]
+        size = None
+        if len(pts) == 4:  # BR, BL, TL, TR -> mean width, mean height (m)
+            d = lambda a, b: float(np.linalg.norm(pts[a] - pts[b]))  # noqa: E731
+            size = [round((d(3, 2) + d(0, 1)) / 2, 4), round((d(1, 2) + d(0, 3)) / 2, 4)]
         layers, grasp = layer_lines(corners, T)
 
         cands.append({"bbox": (x0, y0, x1, y1), "c": (cu, cv_),
                       "xyz_cam": xyz_cam.tolist(), "xyz_base": xyz_base,
-                      "corners": corners, "layers": layers, "grasp": grasp})
+                      "corners": corners, "layers": layers, "grasp": grasp, "size_m": size})
     if not cands:
         return None, []
     # Keep only the box PILE: grow a cluster from the largest candidate and
@@ -340,7 +466,12 @@ def scan(frame, depth_img):
                 cluster.append(c)
                 rest.remove(c)
                 changed = True
-    cands = cluster
+    global _held
+    cands = sorted(cluster, key=lambda c: c["c"][1])  # topmost (grasp target) first
+    # Gripper covering the grasp box -> keep its last full measurement.
+    cands[0], _held = box_hold.choose(_held, cands[0])
+    if cands[0].get("held"):
+        cands[0] = reproject(cands[0], T)
     # Focus = extreme points of the pile, fitted to frame aspect
     xs0 = min(c["bbox"][0] for c in cands); ys0 = min(c["bbox"][1] for c in cands)
     xs1 = max(c["bbox"][2] for c in cands); ys1 = max(c["bbox"][3] for c in cands)
@@ -362,7 +493,7 @@ def main():
             if nf is not None:
                 focus = nf if focus is None else tuple(
                     int(0.7 * o + 0.3 * n_) for o, n_ in zip(focus, nf))
-                cands = sorted(nc, key=lambda c: c["c"][1])  # topmost first
+                cands = nc  # topmost first (scan sorts; keeps a held box at 0)
                 try:
                     with open(COORDS_JSON, "w") as f:
                         json.dump({"t": time.time(), "frame": "base" if cands and cands[0]["xyz_base"] else "camera",
@@ -426,11 +557,13 @@ def main():
             g = c.get("grasp")
             p = g["xyz"] if g else (c["xyz_base"] or c["xyz_cam"])
             txt = f"box #{i+1} {tag}({p[0]:+.3f},{p[1]:+.3f},{p[2]:+.3f})"
+            if c.get("size_m"):  # width x height of the front face
+                txt += f" {c['size_m'][0] * 100:.1f}x{c['size_m'][1] * 100:.1f}cm"
             if i == 0:  # grasp target = top 20-sheet bundle of the topmost box
                 gu, gv = to_disp(g["px"]) if g else (u, v)
                 cv2.drawMarker(disp, (gu, gv), (0, 0, 255), cv2.MARKER_CROSS, 30, 3)
                 cv2.circle(disp, (gu, gv), 12, (0, 0, 255), 2)
-                txt = "GRASP " + txt
+                txt = ("GRASP HELD " if c.get("held") else "GRASP ") + txt
             # Layer cut lines every PITCH (20 sheets) down both edges
             for L in c.get("layers", []):
                 la, lb = to_disp(L["left"]["px"]), to_disp(L["right"]["px"])
@@ -463,7 +596,8 @@ def main():
                 cv2.putText(disp, ctxt, (tx_, ty_), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3)
                 cv2.putText(disp, ctxt, (tx_, ty_), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 150, 255), 1)
 
-        label = f"boxes: {len(cands)}  x{sx:.1f}" if focus is not None else "NO BOXES - FULL VIEW"
+        label = (f"boxes: {len(cands)}  x{sx:.1f}  grav:{_grav_src}" if focus is not None
+                 else "NO BOXES - FULL VIEW")
         cv2.putText(disp, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
         cv2.putText(disp, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 

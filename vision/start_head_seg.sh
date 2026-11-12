@@ -9,6 +9,17 @@ NANO_PY="${NANO_PY:-/home/dexmate-nano/miniconda3/bin/python}"
 NANO_SENDER="${NANO_SENDER:-gstsender/gstsender.py}"  # relative to the nano's $HOME
 RELAY_PY="${RELAY_PY:-/home/dexmate/webrtc/webrtc/bin/python}"
 SEG_PY="${SEG_PY:-/home/dexmate/webrtc/segenv/bin/python}"
+# seg_overlay reads the head IMU (gravity) and robot/joints over zenoh. Without
+# ZENOH_CONFIG dexcomm falls back to mDNS discovery and may never connect.
+# Default: the robot's own config ~/.dexmate/comm/zenoh/<robot>.dzcfg, whose
+# name is the robot name with "/" -> "_" (dm_xxx-1p.dzcfg -> dm/xxx-1p).
+if [ -z "${ZENOH_CONFIG:-}" ]; then
+  ZENOH_CONFIG="$(ls "$HOME"/.dexmate/comm/zenoh/*.dzcfg 2>/dev/null | head -1)"
+fi
+if [ -z "${ROBOT_NAME:-}" ] && [ -n "$ZENOH_CONFIG" ]; then
+  ROBOT_NAME="$(basename "$ZENOH_CONFIG" .dzcfg | sed 's|_|/|')"
+fi
+export ROBOT_NAME ZENOH_CONFIG
 LOG="$HERE/logs"
 mkdir -p "$LOG"
 
