@@ -50,6 +50,14 @@ fi
 cd "$HERE"
 for n in 1 2 3 4 5 6; do
   port="6000$n"
+  # A 60001 relay without the tap (e.g. started by ~/webrtc/run_webrtc_from_robot_config.sh,
+  # 2026-11-16) streams fine but HEAD SEG never gets a frame - replace it with ours.
+  if [ "$n" -eq 1 ] && listening "$port" && ! listening 55601; then
+    pid="$(ss -tlnpH "sport = :$port" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
+    log "relay $port is up without the HEAD SEG tap (pid ${pid:-?}) - restarting it with the tap"
+    [ -n "$pid" ] && kill "$pid"
+    for _ in $(seq 1 25); do listening "$port" || break; sleep 0.2; done
+  fi
   if listening "$port"; then log "relay $port already up"; continue; fi
   tap=""; [ "$n" -eq 1 ] && tap="SEG_TAP_PORT=55601"
   log "starting relay $port"

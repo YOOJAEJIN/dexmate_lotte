@@ -135,6 +135,8 @@ def rect(rays, z, up, px_m, tol=INLIER_M, iters=200, sample=3000, seed=0):
     # every mask pixel's ray cut by the plane -> (a, h) on the face
     den = rays @ (n[0] * right + n[1] * fwd)
     ok = den > 1e-6
+    if ok.sum() < 30:                             # rays (almost) never meet the plane: bad fit
+        return None                               # (2026-11-13: empty h crashed seg_overlay)
     hit = rays[ok] * (off / den[ok])[:, None]
     a, h = np.stack([hit @ right, hit @ fwd], axis=1) @ e, hit @ down
     if h_top > 0:                                 # camera above the pile: the mask also holds

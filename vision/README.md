@@ -1,4 +1,4 @@
-# vision — 상자 더미 세그멘테이션 · 3D 좌표 · 파지점 (HEAD SEG)
+# vision — Targeting System (구 HEAD SEG): 상자 더미 세그멘테이션 · 3D 좌표 · 파지점 / place 타깃 엣지
 
 헤드 ZED X Mini 영상에서 골판지 상자 더미만 분할하고, 실측 depth와 헤드 IMU의 중력 방향으로
 상자 앞면의 꼭짓점·크기·층 경계선(6.1 cm = 20장)·파지점을 계산해
@@ -64,7 +64,7 @@ nano 쪽 `gstsender.py`는 `vision/nano/gstsender.py`를 nano의 `~/gstsender/`�
    (yolo11n-seg 7 ms는 COCO 클래스라 골판지 없음, SAM2.1-tiny everything 6100 ms라 실시간 불가.)
    2초마다 전체 화면 스캔(좌표 계산), 매 프레임 줌 화면 재분할(마스크 표시).
 2. **박스 판별**: 면적 0.5~35% · 화면 85% 이상 가로지르지 않음 · 테두리 2변 이상 접촉 안 함 · depth 0.3~1.6 m ·
-   **채도 기반 갈색 게이트**(H 5~30, S≥95 픽셀 40% 이상 — 이 조명에서 Hue는 상자/크레이트 모두 ~16이라 채도로 구분) ·
+   **채도 기반 갈색 게이트**(H 5~30, S≥80 픽셀 50% 이상 — Hue는 상자/크레이트 모두 ~16이라 채도로 구분. 상자 S는 조명에 따라 89~130, 회색 크레이트 ~67) ·
    가장 큰 후보에서 인접한 것만 묶는 클러스터링.
 3. **포커스 줌**: 더미 끝점 → 4% 여백 → 4:3 맞춤 → EMA(0.7/0.3) → bicubic 확대.
 4. **Depth**: ZED SDK 스테레오(NEURAL)의 `retrieve_measure(DEPTH)`를 mm로 받아 9×9 중앙값.
@@ -104,7 +104,15 @@ nano 쪽 `gstsender.py`는 `vision/nano/gstsender.py`를 nano의 `~/gstsender/`�
 
 `SEG_TAP`(tcp://127.0.0.1:55601) · `SEG_DEPTH_SRC`(192.168.50.22:55703) · `SEG_DEST`/`SEG_PORT`(127.0.0.1/50006) ·
 `SEG_MODEL`(FastSAM-s.pt) · `SEG_CONF`(0.4) · `SEG_SCAN_S`(2.0) · `SEG_PITCH`(0.061) ·
-`SEG_BROWN_H0`/`H1`/`S`/`V`/`MIN`(5/30/95/50/0.4, MIN=0이면 색 필터 끔) · `SEG_HOLD_SELF`/`SEG_HOLD_RATIO`(0.7/0.85) · `SEG_IMU_TOPIC`/`SEG_JOINTS_TOPIC` · `SEG_COORDS_JSON` · `SEG_URDF` · `ROBOT_NAME`/`ZENOH_CONFIG`(zenoh 접속)
+`SEG_BROWN_H0`/`H1`/`S`/`V`/`MIN`(5/30/80/50/0.25, MIN=0이면 색 필터 끔 — 위치가 주 기준이라 색은 벽·팔·그리퍼만 거름) · `SEG_BOX_MIN_W`/`MIN_H`/`MAX`(0.05/0.03/1.2 m, 실측 앞면 크기 상하한 — 점 노이즈·벽 크기 마스크 제외, MIN_W=0이면 끔) · `SEG_MIN_AREA`(0.002, 후보 bbox 최소 화면비) · `SEG_CENTER_FRAC`(0.5, 후보 중심이 화면 가로 가운데 50% 안이어야 함 — 박스는 항상 정면, 0이면 끔) · `SEG_HOLD_SELF`/`SEG_HOLD_RATIO`(0.7/0.85) · `SEG_IMU_TOPIC`/`SEG_JOINTS_TOPIC` · `SEG_COORDS_JSON` · `SEG_URDF` · `ROBOT_NAME`/`ZENOH_CONFIG`(zenoh 접속)
+
+## Targeting System 모드 (2026-11-18)
+
+- **SEG** (기본): 위의 상자 세그멘테이션 그대로.
+- **EDGE**: 왼손 그리퍼가 박스를 쥐었고(KORAS 모터 전류 > 500 mA, 모터 각도 500~5500° — 실측 쥠 815 mA/3414°, 빈손 닫힘 58 mA/6135°, 열림 279 mA/284°) 그리퍼 x축이 수직 ±15° 안(place 자세 0.4°)으로 0.5 s 유지되면 전환. FastSAM 정지, 1.5 s마다 nano HD1200 스냅샷(TCP 55704) → `place_edges/edges.py`로 H5(띠 윗변)·V2(띠 오른쪽)·D(꼭짓점→뒤 윗모서리)·V3(뒤 끝)·K(D×V3 교점) → 화면 + `logs/place_target.json`(최근 5개 중 K 중앙값에 가장 가까운 결과). 검색 영역은 기준 꼭짓점(base 좌표)을 현재 카메라로 투영해 따라감. V2는 LSD가 조각만 주는 경우가 많아 조각에서 위아래로 띠→면 경계를 따라가 전체 길이로 늘린 뒤 H5를 찾고, 기울기(lean)는 이 V2로 계산(사용자: V2가 더 정확, 실측 11.4~11.8°). **박스 중심점** `center`(base, m): B1(V3 발치 오른쪽 바닥선) → 바닥 높이(밝은 바닥 띠 depth 중앙값 — 최근접값은 옆 흰 팔을 집음) → Vb = V3×B1을 바닥 평면에 투영 → 옆면 대각선 C..Vb 중점 + H5 두께/2 만큼 면 안쪽, 최근 5개 중앙값(실측 (1.289, 0.370, 0.864) ±2 mm). B1이 팔에 가리면 `center: null` + `center_why`. 그리퍼가 열리거나 기울면 SEG로 복귀. 관절 전류는 정지 마찰 때문에 같은 자세·빈손에서도 −4.6/−10.8로 갈려 쥠 판정에서 제외.
+- 쥠 판정에는 robot_controller가 robot/joints에 싣는 `hands` 상태가 필요(omniteleop `robot_controller.py`, teleop Start 시 반영). 오른쪽 KORAS는 응답이 없어 `TGT_SIDE=left` 고정.
+- 환경변수: `TGT_SIDE`(left) · `TGT_HOLD_MA`(500) · `TGT_POS_MIN`/`MAX`(500/5500) · `TGT_ALIGN_DEG`(15) · `TGT_SWITCH_S`(0.5) · `TGT_EDGE_S`(1.5) · `TGT_HIRES_SRC`(192.168.50.22:55704) · `TGT_ANCHOR`(1.124,0.409,1.055) · `TGT_PLACE_JSON`
+- 자체 점검: `python place_edges/targeting.py`, `python place_edges/edges.py <hires.png·depth_hi.npy 있는 폴더>`
 
 ## 한계
 

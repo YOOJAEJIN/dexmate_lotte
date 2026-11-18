@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Box-pile segmentation + base-frame coordinates + grasp overlay ("HEAD SEG").
+"""Targeting System (was "HEAD SEG"): SEG mode = box-pile segmentation + base-frame coordinates
++ grasp overlay; EDGE mode = place-target edges once a box is held upright (see TGT_* below).
 
   relay 60001 RGB tap (zmq 55601) ─┬─ every SCAN_S: FastSAM full frame
   nano metric depth (TCP 55703, mm) ┘   -> box candidates (area/border/depth)
@@ -29,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 import cv2
 import numpy as np
@@ -47,6 +49,8 @@ SCAN_S = float(os.getenv("SEG_SCAN_S", "2.0"))
 # Live robot feeds over zenoh (dexcomm; needs ROBOT_NAME + ZENOH_CONFIG in the env).
 IMU_TOPIC = os.getenv("SEG_IMU_TOPIC", "sensors/head_camera/imu")  # nano gstsender, ~140 Hz
 JOINTS_TOPIC = os.getenv("SEG_JOINTS_TOPIC", "robot/joints")       # robot_controller, 100 Hz
+# GUI "Lotte Reach": REQ here -> scan now with frames newer than the request -> JSON reply
+RESCAN_ADDR = os.getenv("SEG_RESCAN", "tcp://127.0.0.1:55610")
 FEED_MAX_AGE_S = 1.0  # older than this = dead feed, never reuse (2026-11-12: a cached
                       # pose from a crashed robot_controller put the camera 22 deg off)
 _HERE = Path(__file__).resolve().parent
@@ -55,6 +59,17 @@ URDF = os.getenv(
     "SEG_URDF",
     str(_HERE.parent / "omniteleop/external/dexmate-urdf/robots/humanoid/vega_1p/vega_1p_gripper.urdf"),
 )
+# Targeting System (2026-11-18): SEG mode = the box segmentation below. EDGE mode = a box is
+# held AND turned upright (place_edges/targeting.py: gripper sensor + gripper tilt) -> FastSAM
+# off, place-target edges (place_edges/edges.py) on HD1200 snapshots instead.
+TGT_SIDE = os.getenv("TGT_SIDE", "left")  # right KORAS sends no status replies (RS485, 2026-11-18)
+HIRES_SRC = os.getenv("TGT_HIRES_SRC", "192.168.50.22:55704")  # nano gstsender HIRES_PORT
+EDGE_S = float(os.getenv("TGT_EDGE_S", "1.5"))  # one HD snapshot + detection per EDGE_S
+EDGE_MEDIAN_N = 5  # shown / saved = the result nearest the median K of the last N good ones
+PLACE_JSON = os.getenv("TGT_PLACE_JSON", str(_HERE / "logs" / "place_target.json"))
+# Base-frame point the edge search is centred on (H5 x V2 corner measured 2026-11-18); it then
+# follows the detected corner, so head / torso moves keep the target inside the tuned ROI.
+TGT_ANCHOR = [float(x) for x in os.getenv("TGT_ANCHOR", "1.124,0.409,1.055").split(",")]
 # vega_1p.yaml reach.camera / camera_mount_rpy_corr
 # ZED factory calibration SN50691325 [LEFT_CAM_FHD1200] (1920x1200), scaled to the
 # 640x480 stream; gstsender resizes non-uniformly (x 1/3, y 0.4) so fx != fy.
@@ -64,12 +79,29 @@ DEPTH_VALID = (0.30, 1.60)
 # 0.0941) was tuned for the Isaac Lab render: on hardware it tilts vertical box
 # edges ~20 deg; with zero they come out ~2 deg (best fit roll +0.025 rad).
 MOUNT_RPY = (0.0, 0.0, 0.0)
-# Cardboard-brown gate (HSV, measured on this robot's lighting 2026-11-10:
-# real box H~16 S~130, grey crate S~67 -> saturation separates them).
-BROWN_MIN_FRAC = float(os.getenv("SEG_BROWN_MIN", "0.4"))  # 0 disables
+# Cardboard-brown gate (HSV). Hue is ~16 for box and grey crate alike, so
+# saturation separates them: box S~130 (11-10) but only S~89 (11-13, other
+# light / exposure), grey crate S~67. S>=80 on >=50% of the inner box: box
+# 0.80-0.88, box+wall superset 0.39, grey crate < 0.5 by its median.
+# 2026-11-17: the box is now a small bundle straight ahead and only 0.32-0.34
+# brown at 0.86 m; position (CENTER_FRAC) is the main gate, colour only keeps
+# out the grey wall, white arm and black gripper (0.00-0.03).
+BROWN_MIN_FRAC = float(os.getenv("SEG_BROWN_MIN", "0.25"))  # 0 disables
 BROWN_H = (int(os.getenv("SEG_BROWN_H0", "5")), int(os.getenv("SEG_BROWN_H1", "30")))
-BROWN_S_MIN = int(os.getenv("SEG_BROWN_S", "95"))
+BROWN_S_MIN = int(os.getenv("SEG_BROWN_S", "80"))
 BROWN_V_MIN = int(os.getenv("SEG_BROWN_V", "50"))
+# Sanity bounds on the measured front face (metres): drops specks and
+# wall-sized masks. The box itself ranges from a 15x14 cm bundle (2026-11-17)
+# to the 40.5x45.5 cm pile (2026-11-12). 0 disables.
+BOX_MIN_W = float(os.getenv("SEG_BOX_MIN_W", "0.05"))
+BOX_MIN_H = float(os.getenv("SEG_BOX_MIN_H", "0.03"))
+# Smallest candidate bbox as a fraction of the image (the 15x14 cm box at
+# 0.86 m is 0.0069; specks below this are noise).
+MIN_AREA = float(os.getenv("SEG_MIN_AREA", "0.002"))
+BOX_MAX = float(os.getenv("SEG_BOX_MAX", "1.2"))
+# The pile is always straight ahead (operator, 2026-11-17): a candidate's centre
+# must lie in the middle CENTER_FRAC of the image width. 0 disables.
+CENTER_FRAC = float(os.getenv("SEG_CENTER_FRAC", "0.5"))
 # Layer pitch along the box's vertical edges: 20 cardboard sheets = 6.1 cm.
 PITCH = float(os.getenv("SEG_PITCH", "0.061"))
 
@@ -121,6 +153,11 @@ import pinocchio as pin  # noqa: E402
 import box_hold  # noqa: E402
 import face_plane  # noqa: E402
 
+sys.path.insert(0, str(_HERE / "place_edges"))
+import edges as place_edges  # noqa: E402
+import targeting  # noqa: E402
+from hires_grab import read_hires  # noqa: E402
+
 _held = None  # last unoccluded grasp box (box_hold)
 
 
@@ -149,6 +186,7 @@ model = (FastSAM if "fastsam" in MODEL.lower() else YOLO)(MODEL)
 pin_model = pin.buildModelFromUrdf(URDF)
 pin_data = pin_model.createData()
 CAM_FRAME = pin_model.getFrameId("zed_left_camera")
+EE_FRAME = pin_model.getFrameId(f"{TGT_SIDE[0].upper()}_ee")
 R_CORR = pin.rpy.rpyToMatrix(*MOUNT_RPY)
 _JOINT_GROUPS = {
     "left_arm": [f"L_arm_j{i+1}" for i in range(7)],
@@ -160,6 +198,7 @@ _JOINT_GROUPS = {
 _feed_lock = threading.Lock()
 _imu = []                           # (t_rx, acc[3]) of the last ~0.5 s
 _joints = {"t": 0.0, "q": None}     # latest robot/joints message
+_hand = {"t_ns": None, "t": 0.0, "status": None}  # TGT_SIDE gripper status; t = when its reply last CHANGED
 _link = {}                          # keeps the node + subscribers alive
 
 
@@ -178,8 +217,11 @@ def _on_imu(m):
 def _on_joints(m):
     j = m.get("joints", m) if isinstance(m, dict) else None
     if isinstance(j, dict):
+        hs = (m.get("hands") or {}).get(TGT_SIDE)  # robot_controller copies the KORAS status here
         with _feed_lock:
             _joints["t"], _joints["q"] = time.time(), j
+            if hs and hs.get("t_ns") != _hand["t_ns"]:  # a repeated reply time = monitor stalled
+                _hand.update(t_ns=hs.get("t_ns"), t=time.time(), status=hs)
 
 
 def _robot_link():
@@ -197,6 +239,12 @@ def _robot_link():
 
 
 threading.Thread(target=_robot_link, daemon=True).start()
+
+
+def gripper_tilt_deg():
+    """Angle between the TGT_SIDE gripper x axis and vertical (deg); valid right after a
+    successful cam_to_base_T() (same FK pass). 0.4 deg in the place pose = box upright."""
+    return float(np.degrees(np.arccos(np.clip(pin_data.oMf[EE_FRAME].rotation[2, 0], -1.0, 1.0))))
 
 
 def cam_to_base_T():
@@ -248,11 +296,12 @@ def _sub(addr):
 
 rgb_sub = _sub(RGB_TAP)
 _depth_latest = None
+_depth_t = 0.0  # arrival time of _depth_latest
 
 
 def _depth_reader():
     """Keep _depth_latest = newest metric depth frame; reconnect forever."""
-    global _depth_latest
+    global _depth_latest, _depth_t
     host, port = DEPTH_SRC.rsplit(":", 1)
     while True:
         try:
@@ -274,6 +323,7 @@ def _depth_reader():
                         first = False
                         continue
                     _depth_latest = np.frombuffer(buf, dtype="<u2").reshape(h, w)
+                    _depth_t = time.time()
         except OSError:
             pass
         _depth_latest = None  # stale depth is worse than none
@@ -281,6 +331,30 @@ def _depth_reader():
 
 
 threading.Thread(target=_depth_reader, daemon=True).start()
+
+# On-demand scan ("Reach" in the GUI): after the head or torso moved, detect +
+# segment again and return the new grasp point - only from frames that arrived
+# after the request.
+_rescan = {"t": 0.0, "result": None}
+_rescan_want, _rescan_done = threading.Event(), threading.Event()
+
+
+def _rescan_server():
+    s = ctx.socket(zmq.REP)
+    s.bind(RESCAN_ADDR)
+    while True:
+        s.recv()
+        _rescan_done.clear()
+        _rescan["t"] = time.time()
+        _rescan_want.set()
+        if _rescan_done.wait(10.0):
+            s.send_json(_rescan["result"])
+        else:
+            _rescan_want.clear()
+            s.send_json({"ok": False, "error": "no fresh camera + depth frame within 10 s"})
+
+
+threading.Thread(target=_rescan_server, daemon=True).start()
 
 
 def _decode(raw):
@@ -380,6 +454,20 @@ def _free_face(m, depth_img, cu, cv_, z):
 _grav_src = "-"  # where the last scan's gravity came from (shown on the overlay)
 
 
+def box_sized(size):
+    """Front face [width, height] (m) the size of the box pile? None = not measurable."""
+    if not BOX_MIN_W:
+        return True
+    if size is None:
+        return False
+    w_, h_ = size
+    return BOX_MIN_W <= w_ <= BOX_MAX and BOX_MIN_H <= h_ <= BOX_MAX
+
+
+assert box_sized([0.417, 0.473]) and box_sized([0.41, 0.061]) and box_sized([0.15, 0.14])  # pile / last bundle / small box
+assert not box_sized([0.02, 0.02]) and not box_sized(None) and not box_sized([2.0, 0.5])      # speck / no face / wall
+
+
 def scan(frame, depth_img):
     """FastSAM full frame -> box candidates with camera+base XYZ, focus bbox."""
     h, w = frame.shape[:2]
@@ -394,8 +482,10 @@ def scan(frame, depth_img):
         x0, y0, x1, y1 = [int(v) for v in box.xyxy[0]]
         bw, bh = x1 - x0, y1 - y0
         area_frac = (bw * bh) / (w * h)
-        if not (0.005 <= area_frac <= 0.35):
+        if not (MIN_AREA <= area_frac <= 0.35):
             continue
+        if CENTER_FRAC and abs((x0 + x1) / 2 - w / 2) > CENTER_FRAC * w / 2:
+            continue  # off to the side: not the pile in front
         if bw / w > 0.85 or bh / h > 0.85:
             continue
         if (x0 < 3) + (y0 < 3) + (x1 > w - 3) + (y1 > h - 3) >= 2:
@@ -436,6 +526,8 @@ def scan(frame, depth_img):
         if len(pts) == 4:  # BR, BL, TL, TR -> mean width, mean height (m)
             d = lambda a, b: float(np.linalg.norm(pts[a] - pts[b]))  # noqa: E731
             size = [round((d(3, 2) + d(0, 1)) / 2, 4), round((d(1, 2) + d(0, 3)) / 2, 4)]
+        if not box_sized(size):
+            continue
         layers, grasp = layer_lines(corners, T)
 
         cands.append({"bbox": (x0, y0, x1, y1), "c": (cu, cv_),
@@ -443,14 +535,11 @@ def scan(frame, depth_img):
                       "corners": corners, "layers": layers, "grasp": grasp, "size_m": size})
     if not cands:
         return None, []
-    # Keep only the box PILE: grow a cluster from the largest candidate and
-    # absorb neighbours whose bbox touches the (slightly expanded) union.
-    # Desk clutter / monitors far from the pile drop out entirely.
-    def _area(c):
-        x0, y0, x1, y1 = c["bbox"]
-        return (x1 - x0) * (y1 - y0)
-
-    rest = sorted(cands, key=_area, reverse=True)
+    # Keep only the box PILE: grow a cluster from the candidate nearest the
+    # image centre (the pile is straight ahead) and absorb neighbours whose bbox
+    # touches the (slightly expanded) union. Seeding from the largest let a big
+    # brown thing elsewhere win over the pile. Clutter far from it drops out.
+    rest = sorted(cands, key=lambda c: abs(c["c"][0] - w / 2) + abs(c["c"][1] - h / 2))
     cluster = [rest.pop(0)]
     gap = 0.06 * (w + h) / 2  # allowed spacing between pile members (px)
     changed = True
@@ -479,17 +568,140 @@ def scan(frame, depth_img):
     return focus, cands
 
 
+_tmode = targeting.Mode()
+_edge = {"busy": False, "t": 0.0, "hist": [], "show": None, "last": None, "anchor": np.array(TGT_ANCHOR)}
+
+
+def _edge_job(T):
+    """One HD1200 snapshot -> place-target edges (background thread: ~0.6 s, video keeps going)."""
+    try:
+        host, port = HIRES_SRC.rsplit(":", 1)
+        with socket.create_connection((host, int(port)), timeout=5) as s:
+            im, dmm = read_hires(s.makefile("rb"))
+        r = place_edges.detect_tracked(im, dmm.astype(np.float32) / 1000.0, T.rotation, T.translation, _edge["anchor"])
+    except Exception as e:
+        r = {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    r["t"] = time.time()
+    if r["ok"]:
+        hist = (_edge["hist"] + [r])[-EDGE_MEDIAN_N:]
+        med = np.median([h_["K"] for h_ in hist], axis=0)  # ~1 in 6 frames picks a wrong LSD piece
+        best = min(hist, key=lambda h_: float(np.linalg.norm(np.array(h_["K"]) - med)))
+        # box centre = median over the last N (the per-frame floor height wanders +-2.5 cm)
+        cs = [h_["center"] for h_ in hist if h_.get("center")]
+        if cs:
+            cm = np.median(cs, axis=0); cc = T.inverse().act(cm)
+            best = {**best, "center_frame": best.get("center"), "center": cm.tolist(), "center_n": len(cs),
+                    "px": {**best["px"], "center": [FX * 3 * cc[0] / cc[2] + CX * 3, FY * 2.5 * cc[1] / cc[2] + CY * 2.5]}}
+        _edge["hist"], _edge["show"] = hist, best
+        if np.linalg.norm(np.array(best["corner"]) - _edge["anchor"]) < 0.05:  # follow, but never jump
+            _edge["anchor"] = np.array(best["corner"])
+        try:
+            with open(PLACE_JSON, "w") as f:
+                json.dump({**best, "n": len(hist), "frame": "base"}, f, indent=1)
+        except Exception:
+            pass
+    _edge["last"] = r
+    _edge["busy"] = False
+
+
+def edge_view(frame):
+    """Live frame zoomed on the place target + the edges of the shown HD result."""
+    h, w = frame.shape[:2]
+    E, r = place_edges, _edge["show"]
+    if r:  # zoom on the detected target (it moves in the image when the head / torso moves)
+        us = [r["px"][k][i] / 3 for k in ("V2", "V3", "D", "K") for i in range(0, len(r["px"][k]), 2)]
+        vs = [r["px"][k][i] / 2.5 for k in ("V2", "V3", "D", "K") for i in range(1, len(r["px"][k]), 2)]
+        x0, y0, x1, y1 = fit_aspect(min(us) - 45, min(vs) - 35, max(us) + 45, max(vs) + 15, w, h)
+    else:
+        x0, y0, x1, y1 = fit_aspect(E.U0 / 3 - 50, E.V0 / 2.5 - 40, E.U1 / 3 + 50, E.V1 / 2.5 + 15, w, h)
+    sx, sy = w / max(1, x1 - x0), h / max(1, y1 - y0)
+    disp = cv2.resize(frame[y0:y1, x0:x1], (w, h), interpolation=cv2.INTER_CUBIC)
+    P = lambda u, v: (int((u / 3 - x0) * sx), int((v / 2.5 - y0) * sy))  # noqa: E731  HD px -> display
+
+    def put(txt, at, col, sc=0.5):
+        cv2.putText(disp, txt, at, cv2.FONT_HERSHEY_SIMPLEX, sc, (0, 0, 0), 4)
+        cv2.putText(disp, txt, at, cv2.FONT_HERSHEY_SIMPLEX, sc, col, 1 if sc < 0.6 else 2)
+
+    if r:
+        px = r["px"]; K = px["K"]
+        for name, s, col in (("V2", px["V2"], (0, 200, 255)), ("H5", px["H5"], (255, 200, 0))):
+            cv2.line(disp, P(s[0], s[1]), P(s[2], s[3]), col, 2); put(name, P(s[2] + 4, s[3]), col)
+        cv2.line(disp, P(px["D"][0], px["D"][1]), P(*K), (0, 0, 255), 2)          # D, extended to K
+        cv2.line(disp, P(*K), P(px["V3"][2], px["V3"][3]), (255, 0, 255), 2)       # V3, extended to K
+        put("D", P((px["D"][0] + K[0]) / 2 - 18, (px["D"][1] + K[1]) / 2), (0, 0, 255))
+        put("V3", P(px["V3"][2] + 4, px["V3"][3]), (255, 0, 255))
+        cv2.circle(disp, P(*K), 7, (0, 255, 255), -1); cv2.circle(disp, P(*K), 7, (0, 0, 0), 1)
+        if px.get("B1"):  # floor line + its corner with V3 (V3 drawn down to it)
+            cv2.line(disp, P(*px["V3"][2:]), P(*px["Vb"]), (255, 0, 255), 2)
+            cv2.line(disp, P(px["B1"][0], px["B1"][1]), P(px["B1"][2], px["B1"][3]), (0, 255, 128), 2); put("B1", P(px["B1"][2] + 4, px["B1"][3]), (0, 255, 128))
+        if px.get("center"):
+            cu, cv_ = P(*px["center"]); cv2.drawMarker(disp, (cu, cv_), (0, 0, 255), cv2.MARKER_CROSS, 26, 3)
+            ce = r["center"]; put(f"CENTER({ce[0]:+.3f},{ce[1]:+.3f},{ce[2]:+.3f})", (cu - 95, cv_ + 26), (0, 0, 255), 0.55)
+        k, c = r["K"], r["corner"]
+        put(f"K({k[0]:+.3f},{k[1]:+.3f},{k[2]:+.3f})", (P(*K)[0] - 80, P(*K)[1] - 14), (0, 255, 255))
+        put(f"C({c[0]:+.3f},{c[1]:+.3f},{c[2]:+.3f})", (P(px["D"][0], px["D"][1])[0] - 150, P(px["D"][0], px["D"][1])[1] + 22), (0, 255, 255))
+        put(f"D {100 * r['D_len_m']:.1f}cm yaw {r['D_yaw_deg']:+.1f}  lean {r['lean_deg']:.1f}deg({r.get('lean_src', '')})  n{len(_edge['hist'])}"
+            f"  {time.time() - r['t']:.1f}s", (10, 50), (255, 255, 255))
+    if r and not r.get("center"):
+        put(f"centre: {r.get('center_why', '-')}", (10, 98), (0, 160, 255))
+    last = _edge["last"]
+    if last is not None and not last.get("ok"):
+        put(f"last snapshot: {last.get('why')}", (10, 74), (0, 160, 255))
+    put("TARGETING: EDGE", (10, 24), (0, 255, 255), 0.6)
+    put(_tmode.why, (10, h - 12), (255, 255, 255), 0.45)
+    return disp
+
+
 def main():
     print(f"[seg] model={MODEL} urdf frame={CAM_FRAME} -> udp {DEST}:{PORT}", flush=True)
     focus, cands, depth_img = None, [], None
     last_scan, n, t0 = 0.0, 0, time.time()
+    global _held
     while True:
         frame = _decode(rgb_sub.recv())
+        t_frame = time.time()
         h, w = frame.shape[:2]
         depth_img = _depth_latest
 
-        if time.time() - last_scan >= SCAN_S:
-            nf, nc = scan(frame, depth_img)
+        # Targeting System: EDGE (box held + upright) replaces the whole SEG path below
+        T_now = cam_to_base_T()
+        with _feed_lock:
+            hs, age = _hand["status"], time.time() - _hand["t"]
+        mode = _tmode.update(hs, age, gripper_tilt_deg() if T_now is not None else None, time.time())
+        if mode == "EDGE":
+            if _rescan_want.is_set():  # Lotte Reach while a box is held: answer, don't time out
+                _rescan["result"] = {"ok": False, "error": "Targeting System is in EDGE mode (box held upright)"}
+                _rescan_want.clear()
+                _rescan_done.set()
+            if not _edge["busy"] and time.time() - _edge["t"] >= EDGE_S and T_now is not None:
+                _edge["busy"], _edge["t"] = True, time.time()
+                threading.Thread(target=_edge_job, args=(T_now,), daemon=True).start()
+            disp = edge_view(frame)
+            out = ensure_gst(w, h)
+            try:
+                out.stdin.write(disp.tobytes())
+                out.stdin.flush()
+            except BrokenPipeError:
+                globals()["gst"] = None
+            continue
+        if _edge["hist"]:  # back to SEG: the next placement starts a fresh median
+            _edge["hist"], _edge["show"], _edge["last"] = [], None, None
+
+        forced = _rescan_want.is_set() and min(t_frame, _depth_t) > _rescan["t"]
+        if forced:
+            _held = None  # the view changed on purpose: measure afresh, don't hold the old box
+        if forced or time.time() - last_scan >= SCAN_S:
+            try:
+                nf, nc = scan(frame, depth_img)
+            except Exception:  # one bad frame must not take HEAD SEG down; log it and keep streaming
+                traceback.print_exc()
+                nf, nc = None, []
+            if forced:
+                _rescan["result"] = {"ok": True, "t": time.time(), "grav": _grav_src,
+                                     "frame": "base" if nc and nc[0]["xyz_base"] else "camera",
+                                     "boxes": nc if nf is not None else []}
+                _rescan_want.clear()
+                _rescan_done.set()
             if nf is not None:
                 focus = nf if focus is None else tuple(
                     int(0.7 * o + 0.3 * n_) for o, n_ in zip(focus, nf))
@@ -596,8 +808,8 @@ def main():
                 cv2.putText(disp, ctxt, (tx_, ty_), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3)
                 cv2.putText(disp, ctxt, (tx_, ty_), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 150, 255), 1)
 
-        label = (f"boxes: {len(cands)}  x{sx:.1f}  grav:{_grav_src}" if focus is not None
-                 else "NO BOXES - FULL VIEW")
+        label = (f"TARGETING: SEG  boxes: {len(cands)}  x{sx:.1f}  grav:{_grav_src}" if focus is not None
+                 else "TARGETING: SEG  NO BOXES - FULL VIEW")
         cv2.putText(disp, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
         cv2.putText(disp, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
