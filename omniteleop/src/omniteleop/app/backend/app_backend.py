@@ -14,6 +14,7 @@ Usage:
 
 import asyncio
 import json
+import math
 import os
 import re
 import subprocess
@@ -28,7 +29,7 @@ import cv2
 import numpy as np
 import tyro
 from dexcomm import Node
-from dexcomm.codecs import DictDataCodec
+from dexcomm.codecs import DictDataCodec, IMUDataCodec
 from dexcomm.utils import RateLimiter
 from dexcontrol.robot import Robot
 from dexcontrol.core.config import get_robot_config
@@ -265,8 +266,31 @@ class TeleopApp:
         self._chassis_expire_at: float = 0.0  # heartbeat deadline (epoch)
         self._chassis_heartbeat_timeout = 0.6  # s without heartbeat -> auto stop
 
+        # ---- chassis turn by angle (/control/chassis_turn) -------------------
+        # Closed loop on the head IMU gyro: its rate about gravity-up is the base
+        # yaw rate (the head turns with the base). Integrated in the callback.
+        self._imu_lock = threading.Lock()
+        self._imu_yaw = 0.0                 # rad, CCW positive, arbitrary zero
+        self._imu_t: Optional[float] = None  # time of the last IMU sample
+        self._turn_busy = False
+        self._turn_abort = False
+        # Own Node: adding a subscriber to self._node while its joint callbacks
+        # run raised "RuntimeError: Already borrowed" and killed the backend
+        # (2026-11-18). An optional feature must never stop the backend, so a
+        # failure here only disables the turn (it then answers 503).
+        try:
+            self._imu_node = Node(name="app_backend_imu", namespace=namespace)
+            self._imu_node.create_subscriber(
+                "sensors/head_camera/imu",
+                callback=self._on_head_imu,
+                decoder=IMUDataCodec.decode,
+            )
+        except Exception as e:
+            logger.warning(f"Head IMU subscriber failed ({e}) - chassis turn disabled")
+
         # ---- reach (camera-based object approach) ----------------------------
         self._reach_in_progress = False
+        self._lotte_reach_busy = False
         self._reach_receivers: Dict[str, Any] = {}  # "ip:port" -> WebRTCReceiver
         self._reach_lock = threading.Lock()
         # Long-lived planner daemon (pantos venv): keeps Grounding DINO + the
@@ -785,6 +809,7 @@ class TeleopApp:
             The robot latches the last velocity, so velocity is published only on
             transitions; a watchdog publishes zero velocity if heartbeats stop.
             """
+            self._turn_abort = True  # any chassis button cancels a running /control/chassis_turn
             try:
                 body = await request.json()
                 direction = body.get("direction")
@@ -819,6 +844,77 @@ class TeleopApp:
             except Exception as e:
                 logger.error(f"Error in control_chassis: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
+
+        @app.post("/control/chassis_turn")
+        async def control_chassis_turn(request: Request):
+            """Turn the base in place by {"deg": 90} (+ = left/CCW, - = right), slowly.
+
+            Closed loop on the head IMU gyro, refused without a live IMU. Uses
+            the chassis buttons' dead-man path: the hold is refreshed every
+            0.1 s, so the watchdog stops the base if this loop dies. Stops on
+            E-Stop, IMU loss, a time limit, or any chassis button press.
+            Config (optional): chassis_turn: {wz: 0.2 rad/s, lead_deg: 2.0}.
+            """
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            try:
+                deg = float(body.get("deg", 90.0))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="deg must be a number")
+            if not 1.0 <= abs(deg) <= 180.0:
+                raise HTTPException(status_code=400, detail="deg must be within +-1..180")
+            if not self._teleop_running:
+                raise HTTPException(status_code=409, detail="Start teleop first")
+            if await state_manager.is_estop():
+                raise HTTPException(status_code=403, detail="E-Stop is active")
+            if self._turn_busy:
+                raise HTTPException(status_code=409, detail="A turn is already running")
+            with self._imu_lock:
+                t_imu, yaw0 = self._imu_t, self._imu_yaw
+            if t_imu is None or time.time() - t_imu > 0.5:
+                raise HTTPException(status_code=503, detail="No live head IMU (nano gstsender) - turn refused")
+
+            cfg = self.config.get("chassis_turn", {}) or {}
+            wz = float(cfg.get("wz", 0.2))            # rad/s; 0.2 -> ~90 deg in 9-10 s
+            lead = math.radians(float(cfg.get("lead_deg", 2.0)))  # stop latency allowance
+            sign = 1.0 if deg > 0 else -1.0
+            target = math.radians(abs(deg)) - lead
+            limit = math.radians(abs(deg)) / wz * 1.6 + 2.0
+            self._turn_busy, self._turn_abort = True, False
+            t0, reason = time.time(), "reached"
+            logger.info(f"Chassis turn {deg:+.0f} deg at {wz:.2f} rad/s")
+            try:
+                while True:
+                    with self._imu_lock:
+                        t_imu, yaw = self._imu_t, self._imu_yaw
+                    if (yaw - yaw0) * sign >= target:
+                        break
+                    if self._turn_abort:
+                        reason = "chassis button pressed"; break
+                    if await state_manager.is_estop():
+                        reason = "E-Stop"; break
+                    if time.time() - t_imu > 0.5:
+                        reason = "head IMU lost"; break
+                    if time.time() - t0 > limit:
+                        reason = "time limit"; break
+                    self._chassis_hold = "turn"
+                    self._chassis_expire_at = time.time() + self._chassis_heartbeat_timeout
+                    self._publish_chassis_velocity(0.0, 0.0, sign * wz)
+                    await asyncio.sleep(0.1)
+            finally:
+                self._chassis_hold = None
+                self._publish_chassis_velocity(0.0, 0.0, 0.0)
+                self._turn_busy = False
+            await asyncio.sleep(1.5)  # let it settle, then read where it ended up
+            with self._imu_lock:
+                turned = math.degrees(self._imu_yaw - yaw0)
+            logger.info(f"Chassis turn {deg:+.0f} deg: {reason}, turned {turned:+.1f} deg")
+            if reason != "reached":
+                raise HTTPException(status_code=409, detail=f"Turn stopped ({reason}) after {turned:+.1f} deg")
+            return {"status": "ok", "target_deg": deg, "turned_deg": round(turned, 1),
+                    "elapsed_s": round(time.time() - t0, 1)}
 
         @app.post("/control/hand")
         async def control_hand(request: Request):
@@ -933,6 +1029,19 @@ class TeleopApp:
                 return await self._run_reach(request)
             finally:
                 self._reach_in_progress = False
+
+        @app.post("/control/lotte_reach")
+        async def control_lotte_reach(request: Request):
+            """Lotte Reach: detect + segment again now and return the grasp point.
+
+            For after the head angle or torso height changed. No arm motion."""
+            if self._lotte_reach_busy:
+                raise HTTPException(status_code=409, detail="lotte reach already in progress")
+            self._lotte_reach_busy = True
+            try:
+                return await self._run_lotte_reach(request)
+            finally:
+                self._lotte_reach_busy = False
 
         # -- E-Stop ----------------------------------------------------------
         @app.post("/robots/estop")
@@ -1080,6 +1189,19 @@ class TeleopApp:
             },
         }
         self.common_pub.publish(cmd)
+
+    def _on_head_imu(self, m) -> None:
+        """Integrate the head IMU gyro about gravity-up (= chassis yaw rate)."""
+        try:
+            a = np.asarray(m["acc"], float)
+            w = float(np.asarray(m["gyro"], float) @ (a / np.linalg.norm(a)))
+        except Exception:
+            return
+        now = time.time()
+        with self._imu_lock:
+            if self._imu_t is not None and now - self._imu_t < 0.2:  # skip gaps
+                self._imu_yaw += w * (now - self._imu_t)
+            self._imu_t = now
 
     async def _chassis_watchdog_loop(self):
         """Auto-stop the chassis when press heartbeats stop arriving.
@@ -1777,6 +1899,18 @@ class TeleopApp:
                 detail="robot joint states unavailable — is the teleop stack running?",
             )
 
+        # Fail before anything moves if the planner env isn't on this machine
+        # (the configured path is often another PC's).
+        planner_python = reach_cfg.get(
+            "planner_python", "/home/ubuntu/dx/pantos_tele/.venv/bin/python"
+        )
+        if not Path(str(planner_python)).exists():
+            raise HTTPException(
+                status_code=503,
+                detail=f"reach planner not set up on this robot: {planner_python} "
+                "not found (configs/vega_1p.yaml reach.planner_python)",
+            )
+
         # 2. Optional head preset so the object lands inside the center ROI
         _t0 = time.perf_counter()
         _reach_timing: Dict[str, float] = {}
@@ -1859,6 +1993,10 @@ class TeleopApp:
             raise HTTPException(
                 status_code=504, detail=f"reach planner timed out after {timeout_s:.0f}s"
             )
+        except (OSError, RuntimeError) as e:
+            # Unhandled, this becomes a bare 500 without CORS headers and the
+            # browser only says "Load failed".
+            raise HTTPException(status_code=502, detail=f"reach planner failed: {e}")
         _reach_timing["planner_daemon"] = round(time.perf_counter() - _t2, 3)
 
         planner_stages = (result.get("timings") or {}).get("stages", {})
@@ -1888,6 +2026,43 @@ class TeleopApp:
             f"🫷 Reach: published arm targets "
             f"(arm={result.get('arm')}, xyz={[round(v, 3) for v in result.get('xyz_base', [])]})"
         )
+        return result
+
+    async def _run_lotte_reach(self, request: Request) -> Dict[str, Any]:
+        """POST /control/lotte_reach: fresh HEAD SEG scan -> boxes + grasp point.
+
+        Asks vision/seg_overlay.py (zmq REQ, configs lotte_reach.seg_rescan) to
+        scan with camera / depth frames newer than this request. Nothing moves.
+        """
+        import zmq
+
+        cfg = self.config.get("lotte_reach", {}) or {}
+        addr = cfg.get("seg_rescan", "tcp://127.0.0.1:55610")
+        timeout_s = float(cfg.get("timeout_s", 15))
+
+        def ask() -> Dict[str, Any]:
+            sock = zmq.Context.instance().socket(zmq.REQ)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.RCVTIMEO, int(timeout_s * 1000))
+            sock.setsockopt(zmq.SNDTIMEO, 2000)
+            sock.connect(addr)
+            try:
+                sock.send(b"scan")
+                return sock.recv_json()
+            finally:
+                sock.close()
+
+        t0 = time.perf_counter()
+        try:
+            result = await asyncio.to_thread(ask)
+        except zmq.error.Again:
+            raise HTTPException(
+                status_code=504,
+                detail=f"HEAD SEG did not answer on {addr} - is vision/start_head_seg.sh running?",
+            )
+        if not result.get("ok"):
+            raise HTTPException(status_code=502, detail=result.get("error") or "HEAD SEG scan failed")
+        result["elapsed_s"] = round(time.perf_counter() - t0, 3)
         return result
 
     # ------------------------------------------------------------------

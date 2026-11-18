@@ -150,15 +150,16 @@ export const TorsoControl: React.FC<TorsoControlProps> = ({ apiUrl, disabled }) 
 
         <SectionLabel>Cartesian</SectionLabel>
 
-        {/* Torso Cartesian Control: front/back (X) and up/down (Z) */}
+        {/* Torso Cartesian Control: front/back (X) and up/down (Z). One click = one 1 cm step
+            (no hold-repeat: repeats piled up ahead of the 0.2 rad/s torso and it kept moving after release). */}
         <div className="grid grid-cols-3 gap-2">
           <div />
           <button
-            {...holdPointerHandlers(hold, () => void handleTorsoAxisControl(2, 0.01), disabled)}
+            onClick={() => void handleTorsoAxisControl(2, 0.01)}
             disabled={disabled}
             className={`${buttonClass} flex-col gap-1`}
             style={buttonStyle}
-            title="Torso Up (Z+) (hold)"
+            title="Torso Up (Z+) — 1 cm per click"
           >
             <ArrowUp size={20} />
             <span className="text-[10px] font-medium">Up</span>
@@ -166,11 +167,11 @@ export const TorsoControl: React.FC<TorsoControlProps> = ({ apiUrl, disabled }) 
           <div />
 
           <button
-            {...holdPointerHandlers(hold, () => void handleTorsoAxisControl(0, -0.01), disabled)}
+            onClick={() => void handleTorsoAxisControl(0, -0.01)}
             disabled={disabled}
             className={`${buttonClass} flex-col gap-1`}
             style={buttonStyle}
-            title="Torso Back (X-) (hold)"
+            title="Torso Back (X-) — 1 cm per click"
           >
             <ArrowLeft size={20} />
             <span className="text-[10px] font-medium">Back</span>
@@ -179,11 +180,11 @@ export const TorsoControl: React.FC<TorsoControlProps> = ({ apiUrl, disabled }) 
             <Move size={20} className="text-muted-foreground/60" />
           </div>
           <button
-            {...holdPointerHandlers(hold, () => void handleTorsoAxisControl(0, 0.01), disabled)}
+            onClick={() => void handleTorsoAxisControl(0, 0.01)}
             disabled={disabled}
             className={`${buttonClass} flex-col gap-1`}
             style={buttonStyle}
-            title="Torso Front (X+) (hold)"
+            title="Torso Front (X+) — 1 cm per click"
           >
             <ArrowRight size={20} />
             <span className="text-[10px] font-medium">Front</span>
@@ -191,11 +192,11 @@ export const TorsoControl: React.FC<TorsoControlProps> = ({ apiUrl, disabled }) 
 
           <div />
           <button
-            {...holdPointerHandlers(hold, () => void handleTorsoAxisControl(2, -0.01), disabled)}
+            onClick={() => void handleTorsoAxisControl(2, -0.01)}
             disabled={disabled}
             className={`${buttonClass} flex-col gap-1`}
             style={buttonStyle}
-            title="Torso Down (Z-) (hold)"
+            title="Torso Down (Z-) — 1 cm per click"
           >
             <ArrowDown size={20} />
             <span className="text-[10px] font-medium">Down</span>

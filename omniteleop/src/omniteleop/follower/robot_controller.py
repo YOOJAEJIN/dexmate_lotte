@@ -175,6 +175,10 @@ class RobotController:
             filter_config=filter_config, control_rate=self.control_rate
         )
 
+        # start_in_place: Start keeps the robot exactly where it is - no move to
+        # init_pos, no gripper INIT sweep / open (it may be holding a box).
+        self.start_in_place = bool(self.config.get("start_in_place", False))
+
         # Determine hand type from ROBOT_CONFIG env var
         robot_config = os.environ.get("ROBOT_CONFIG", "vega_1_f5d6")
         if "gripper" in robot_config:
@@ -284,19 +288,28 @@ class RobotController:
                 self.left_ee_type, self.robot.left_arm, side="left"
             )
             if self.left_hand_controller:
-                self.left_hand_controller.activate()
-                self.left_hand_controller.start_tracking()
+                self._start_hand(self.left_hand_controller, "left")
 
         if self.robot.right_arm.enable_ee_pass_through:
             self.right_hand_controller = HandControllerFactory.create_hand_controller(
                 self.right_ee_type, self.robot.right_arm, side="right"
             )
             if self.right_hand_controller:
-                self.right_hand_controller.activate()
-                self.right_hand_controller.start_tracking()
+                self._start_hand(self.right_hand_controller, "right")
 
         # Parse home positions from config (no hardware movement)
         self._parse_home_positions()
+
+        if self.start_in_place:
+            # Home = where the robot is now, so the "move to home" below only sets
+            # every joint's target to its current position (no motion) and also
+            # seeds ruckig. Grippers are left alone.
+            current = self._get_robot_joint_pos()
+            for component in ("torso", "left_arm", "right_arm", "head"):
+                if component in current:
+                    self.home_positions[component] = current[component]
+            logger.info("start_in_place: holding the current pose (no home move, grippers untouched; "
+                        "grippers need one normal Start after power-on for their INIT)")
 
         if self.interpolation_method == "ruckig":
             self._init_ruckig_generators()
@@ -307,6 +320,28 @@ class RobotController:
         self._robot_mode = RobotMode.RUNNING
 
         logger.success("Robot controller initialized")
+
+    def _start_hand(self, ctrl, side: str) -> None:
+        """Activate (INIT) + start status tracking of one hand controller.
+
+        start_in_place skips INIT - its calibration sweep would drop a held box -
+        except for a KORAS that reports motor_enabled=False: it was power-cycled,
+        holds nothing and ignores every command until INIT (2026-11-18: Close did
+        nothing after a reboot). Unknown status (no valid reply) -> no INIT.
+        """
+        if not self.start_in_place:
+            ctrl.activate()
+            ctrl.start_tracking()
+            return
+        ctrl.start_tracking()
+        time.sleep(0.5)  # ~10 status polls at 20 Hz
+        enabled = getattr(ctrl, "_last_status", {}).get("motor_enabled")
+        if enabled is False:
+            logger.info(f"{side} gripper not initialised since power-on -> INIT")
+            ctrl.activate()
+        elif enabled is None:
+            logger.warning(f"{side} gripper: no valid status reply - INIT skipped "
+                           "(check its RS485 link; it may ignore commands)")
 
     def _init_ruckig_generators(self) -> None:
         """Initialize per-component ruckig trajectory generators from home positions."""
@@ -378,7 +413,7 @@ class RobotController:
             rate_limiter.sleep()
 
         # Open hands only if robot has hands
-        if self.hand_type is not None:
+        if self.hand_type is not None and not self.start_in_place:
             self.robot.left_hand.open_hand()
             self.robot.right_hand.open_hand()
         self.robot.estop.activate()
@@ -506,8 +541,10 @@ class RobotController:
             self.robot.move_to_joint_pos(arm_head_pose)
             logger.info("Robot moved to home position")
 
-        # Open hands only if robot has hands
-        if self.hand_type is not None:
+        # Open hands only if robot has hands (not when starting in place: may hold a box)
+        if self.start_in_place:
+            pass
+        elif self.hand_type is not None:
             self.robot.left_hand.open_hand()
             self.robot.right_hand.open_hand()
         else:
@@ -586,7 +623,9 @@ class RobotController:
             # dexcontrol 0.5: move_to_joint_pos() returns a MotionHandle; the old
             # wait_time/exit_on_reach args are replaced by handle.wait(timeout=...),
             # which blocks until the motion plugin reports completion.
-            handle = self.robot.head.move_to_joint_pos(self.home_positions["head"])
+            head_target = (self.robot.head.get_joint_pos().tolist() if self.start_in_place
+                           else self.home_positions["head"])  # in place: keep the head where it is
+            handle = self.robot.head.move_to_joint_pos(head_target)
             try:
                 handle.wait(timeout=5.0)
             except TimeoutError:
@@ -937,6 +976,13 @@ class RobotController:
                 "timestamp_ns": time.time_ns(),
                 "joints": joint_positions,
                 "velocities": joint_velocities,
+                # Gripper sensor status (KORAS: motor current / position) for the
+                # Targeting System's grasp detection; t_ns = reply time, 0 = none yet.
+                "hands": {
+                    side: {**ctrl._last_status, "t_ns": getattr(ctrl, "_last_timestamp", 0)}
+                    for side, ctrl in (("left", self.left_hand_controller), ("right", self.right_hand_controller))
+                    if ctrl is not None and getattr(ctrl, "_last_status", None)
+                },
             }
 
             # Publish via Zenoh

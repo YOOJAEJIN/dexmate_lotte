@@ -250,6 +250,12 @@ recorder:
     left_wrist_rgb: true
     right_wrist_rgb: true
 
+# Start keeps the robot where it is: no move to init_pos below, no gripper
+# INIT sweep / open (it may be holding a box). Grippers still need one Start
+# with false after power-on for their INIT calibration. The real robot runs
+# true; this copy keeps false for the simulator.
+start_in_place: false
+
 init_pos:
   left_arm: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   right_arm: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -303,3 +309,10 @@ reach:
   depth_sample: "min"
   depth_min_valid_m: 0.30     # ignore depths nearer than this (own arms)
   depth_max_valid_m: 3.0      # ignore depths farther than this (background)
+
+# Lotte Reach (GUI card): press after the head angle or torso height changed ->
+# HEAD SEG (vision/seg_overlay.py) detects + segments again with fresh frames
+# and returns the boxes, their size and the grasp point. No arm motion.
+lotte_reach:
+  seg_rescan: "tcp://127.0.0.1:55610"   # seg_overlay SEG_RESCAN
+  timeout_s: 15

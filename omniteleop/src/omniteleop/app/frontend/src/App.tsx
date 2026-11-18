@@ -13,7 +13,7 @@ import { ArmControl } from './components/ArmControl'
 import { TorsoControl } from './components/TorsoControl'
 import { GripperControl } from './components/GripperControl'
 import { PredefinedPoseControl } from './components/PredefinedPoseControl'
-import {ReachControl} from "./components/ReachControl.tsx";
+import {LotteReachControl} from "./components/LotteReachControl.tsx";
 import { DebugPanel } from './components/DebugPanel'
 import { Card, CardContent, CardHeader, CardTitle } from './components/ui/card'
 import { type TeleopLaunchConfig } from './components/TeleopControls'
@@ -284,11 +284,12 @@ export default function App() {
                 {(config?.port || [])
                   .map((port, idx) => ({ port, pos: config?.position?.[idx] || `Camera ${idx + 1}` }))
                   // Head cameras are a stereo pair; one view is enough in the UI.
-                  .filter(({ pos }) => pos !== 'head_right_rgb')
+                  // Wrist cameras are not used (2026-11-17); their relays keep running.
+                  .filter(({ pos }) => !['head_right_rgb', 'left_wrist_rgb', 'right_wrist_rgb'].includes(pos))
                   .map(({ port, pos }, idx) => (
                   <div key={port} className="flex flex-col gap-1.5">
                     <h6 className="text-[10px] font-bold text-muted-foreground/80 uppercase tracking-widest pl-1">
-                      {(pos === 'head_left_rgb' ? 'head camera' : pos).replace(/_/g, ' ')}
+                      {({ head_left_rgb: 'head camera', head_seg: 'targeting system' }[pos] ?? pos).replace(/_/g, ' ')}
                     </h6>
                     <div className="relative aspect-[4/3] w-full bg-black rounded-lg overflow-hidden border border-border shadow-inner group">
                       <iframe
@@ -315,7 +316,7 @@ export default function App() {
               <TorsoControl apiUrl={apiUrl} disabled={!teleopRunning} />
             </div>
             <PredefinedPoseControl apiUrl={apiUrl} disabled={!teleopRunning} />
-            <ReachControl apiUrl={apiUrl} disabled={!teleopRunning} />
+            <LotteReachControl apiUrl={apiUrl} disabled={!teleopRunning} />
             <ObservationPanel observations={teleopRunning ? state.observations : {}} accentColor="bg-emerald-800" />
             <ActionPanel
               title="Action Command"

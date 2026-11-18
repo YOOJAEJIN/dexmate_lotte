@@ -9,7 +9,7 @@ interface GripperControlProps {
 }
 
 type GripperPose = 'open' | 'close';
-type GripperSide = 'left' | 'right';
+type GripperSide = 'left' | 'right' | 'both';  // 'both' = one command for both hands
 
 export const GripperControl: React.FC<GripperControlProps> = ({ apiUrl, disabled }) => {
   const sendPose = async (pose: GripperPose, side: GripperSide) => {
@@ -33,13 +33,13 @@ export const GripperControl: React.FC<GripperControlProps> = ({ apiUrl, disabled
 
   const sideControls = (side: GripperSide) => (
     <>
-      <SectionLabel className="w-full self-stretch capitalize">{side} Gripper</SectionLabel>
+      <SectionLabel className="w-full self-stretch capitalize">{side === 'both' ? 'Both Grippers' : `${side} Gripper`}</SectionLabel>
       <div className="grid grid-cols-2 gap-2 w-full flex-1 min-h-10">
         <button
           onClick={() => void sendPose('close', side)}
           disabled={disabled}
           className={buttonClass}
-          title={`Close ${side} gripper`}
+          title={side === 'both' ? 'Close both grippers' : `Close ${side} gripper`}
         >
           <Grab size={18} className={side === 'left' ? '-scale-x-100' : ''} />
           Close
@@ -48,7 +48,7 @@ export const GripperControl: React.FC<GripperControlProps> = ({ apiUrl, disabled
           onClick={() => void sendPose('open', side)}
           disabled={disabled}
           className={buttonClass}
-          title={`Open ${side} gripper`}
+          title={side === 'both' ? 'Open both grippers' : `Open ${side} gripper`}
         >
           <Hand size={18} className={side === 'left' ? '-scale-x-100' : ''} />
           Open
@@ -65,6 +65,7 @@ export const GripperControl: React.FC<GripperControlProps> = ({ apiUrl, disabled
       <CardContent className="p-3 flex-1 flex flex-col items-center gap-2">
         {sideControls('left')}
         {sideControls('right')}
+        {sideControls('both')}
       </CardContent>
     </Card>
   );

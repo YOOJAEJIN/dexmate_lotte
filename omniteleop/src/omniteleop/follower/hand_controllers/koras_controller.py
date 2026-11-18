@@ -55,6 +55,9 @@ class KorasController(BaseHandController):
     # of < 0.5 maps to open and >= 0.5 maps to close (Robotiq-style: 1.0 = close).
     POSITION_CLOSE_THRESHOLD = 0.5
 
+    # set_position() repeats an unchanged open/close command at most this often.
+    RESEND_S = 1.0
+
     def __init__(self, arm, side: str = "unknown"):
         """
         Initialize the KORAS controller.
@@ -69,6 +72,8 @@ class KorasController(BaseHandController):
         self._monitor_thread = None
         self._last_status: Dict[str, Any] = {}
         self._last_timestamp = 0
+        self._last_cmd: Optional[str] = None  # last open/close sent by set_position
+        self._last_cmd_t = 0.0
 
     def _hex_to_bytes(self, hex_str: str) -> bytes:
         return bytes.fromhex(hex_str.replace(" ", ""))
@@ -122,11 +127,18 @@ class KorasController(BaseHandController):
 
         # Use the first value in the list and clip to [0, 1]
         p = max(0.0, min(1.0, pos[0]))
+        want = "close" if p >= self.POSITION_CLOSE_THRESHOLD else "open"
 
-        if p >= self.POSITION_CLOSE_THRESHOLD:
-            self.close()
-        else:
-            self.open()
+        # robot_controller calls this every control cycle (100 Hz) with the last
+        # command it received, so send only on change - the 100 Hz flood of
+        # identical writes swamped the RS485 bus (garbled status replies on the
+        # right arm, 2026-11-13). Resend every RESEND_S in case a frame was lost.
+        # ponytail: fixed 1 s retry, no ACK check; read the 0x10 reply if lost commands show up.
+        now = time.monotonic()
+        if want == self._last_cmd and now - self._last_cmd_t < self.RESEND_S:
+            return
+        self._last_cmd, self._last_cmd_t = want, now
+        self.close() if want == "close" else self.open()
 
     def _compute_crc16(self, data: bytes) -> int:
         """Computes the Modbus RTU CRC16."""
