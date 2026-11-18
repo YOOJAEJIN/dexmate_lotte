@@ -149,6 +149,46 @@ _frame_i = 0
 
 
 ############################################################
+# HI-RES SNAPSHOT (2026-11-18) for edge detection on the place target.
+# The streams above are 640x480 x264; the camera grabs HD1200. Connect ->
+# the next grab's full-res rectified LEFT (PNG) + metric depth (uint16 mm),
+# then the socket closes. Frame: struct ">HHII" (w, h, png bytes, depth bytes)
+# + png + little-endian uint16 depth. Encoding runs off the grab loop.
+############################################################
+HIRES_PORT = 55704
+_hires_wait = []
+_hires_lock = threading.Lock()
+
+
+def _hires_send(conns, left, depth):
+    ok, png = cv2.imencode(".png", left)
+    mm = np.clip(np.nan_to_num(depth * _unit_to_mm, nan=0.0, posinf=0.0, neginf=0.0), 0, 65535).astype("<u2")
+    h, w = mm.shape
+    payload = struct.pack(">HHII", w, h, png.nbytes, mm.nbytes) + png.tobytes() + mm.tobytes()
+    for c in conns:
+        try:
+            c.sendall(payload)
+        except OSError:
+            pass
+        c.close()
+
+
+def _hires_server():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", HIRES_PORT))
+    srv.listen(4)
+    while True:
+        conn, _ = srv.accept()
+        with _hires_lock:
+            _hires_wait.append(conn)
+
+
+threading.Thread(target=_hires_server, daemon=True).start()
+print(f"HI-RES SNAPSHOT TCP SERVER :{HIRES_PORT}")
+
+
+############################################################
 # HEAD IMU -> zenoh  (added 2026-11-11, backup: gstsender.py.bak_20261111_preimu)
 # dexsensor-compatible: {ROBOT_NAME}/sensors/head_camera/imu, IMUDataCodec
 #   acc [m/s^2], gyro [rad/s] (ZED gives deg/s), quat [w, x, y, z], timestamp_ns
@@ -353,6 +393,14 @@ while True:
             with _depth_cv:
                 _latest_depth["buf"] = payload
                 _depth_cv.notify_all()
+
+        if _hires_wait:
+            with _hires_lock:
+                conns, _hires_wait[:] = list(_hires_wait), []
+            zed.retrieve_measure(measure_mat, sl.MEASURE.DEPTH)
+            # copies: the Mats are overwritten by the next grab
+            threading.Thread(target=_hires_send, daemon=True, args=(
+                conns, left_mat.get_data()[:, :, :3].copy(), measure_mat.get_data().copy())).start()
 
     # ########################################################
     # # LEFT WRIST
